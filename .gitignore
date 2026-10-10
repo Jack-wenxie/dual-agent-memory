@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Local data, keys and generated state (never commit)
+memory-data/
+bti-data/
+mqe/data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+
+# Local BTI configuration and journal
+bti/fail_closed_exclude_narrow.json
+bti/bti_memory_roots.json
+bti/memory_save_tx.journal.jsonl
+
+# Python caches
+__pycache__/
+*.pyc

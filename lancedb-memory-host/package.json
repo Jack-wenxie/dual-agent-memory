@@ -1,0 +1,22 @@
+{
+  "name": "lancedb-memory-mcp-server",
+  "version": "0.10.0",
+  "description": "Local LanceDB memory MCP server for Claude Code and Codex",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "test": "node --import tsx --test --test-concurrency=1 \"test/*.test.mjs\""
+  },
+  "dependencies": {
+    "@lancedb/lancedb": "^0.27.1",
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "express": "^5.1.0",
+    "zod": "^3.25.67"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.2",
+    "@types/node": "^22.15.19",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

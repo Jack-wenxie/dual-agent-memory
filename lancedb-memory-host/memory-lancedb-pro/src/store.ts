@@ -1,0 +1,1331 @@
+/**
+ * LanceDB Storage Layer with Multi-Scope Support
+ */
+
+import type * as LanceDB from "@lancedb/lancedb";
+import {captureNativeBranch, unknownBranch, freezePrivateCopy, type BranchScoreEvidence} from "./private-score-provenance.js";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  existsSync,
+  accessSync,
+  constants,
+  mkdirSync,
+  realpathSync,
+  lstatSync,
+} from "node:fs";
+import { dirname } from "node:path";
+
+type SafeErrorType = "Error" | "TypeError" | "RangeError" | "NonError";
+
+function safeErrorDiagnostic(error: unknown, code: string): { code: string; type: SafeErrorType; digest: string } {
+  const type: SafeErrorType = error instanceof TypeError ? "TypeError"
+    : error instanceof RangeError ? "RangeError"
+      : error instanceof Error ? "Error" : "NonError";
+  const raw = error instanceof Error ? `${error.name}:${error.message}` : String(error);
+  return { code, type, digest: createHash("sha256").update(raw, "utf8").digest("hex") };
+}
+
+export type NativeTimeoutSource = "deadline_guard" | "materialization_timeout" | "deadline_after_error" | "unknown";
+
+export class NativeQueryTimeoutError extends Error {
+  readonly code = "NATIVE_QUERY_TIMEOUT";
+
+  readonly timeoutSource: NativeTimeoutSource;
+
+  constructor(options?: ErrorOptions & { timeoutSource?: NativeTimeoutSource }) {
+    super("Native retrieval query exceeded its bounded deadline", options);
+    this.timeoutSource = options?.timeoutSource ?? "deadline_guard";
+    this.name = "NativeQueryTimeoutError";
+  }
+}
+
+export function isNativeQueryTimeoutError(error: unknown): boolean {
+  if (error instanceof NativeQueryTimeoutError) return true;
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code?: unknown }).code ?? "")
+    : "";
+  if (["NATIVE_QUERY_TIMEOUT", "DEADLINE_EXCEEDED", "DeadlineExceeded"].includes(code)) return true;
+  const name = error instanceof Error ? error.name : "";
+  const message = error instanceof Error ? error.message : String(error);
+  return /deadline/iu.test(name) || /deadline\s+(?:has\s+)?(?:elapsed|exceeded)/iu.test(message)
+    || /(?:operation|query|request)\s+(?:timed\s*out|timeout)/iu.test(message);
+}
+
+type NativeQueryDeadline = { readonly deadlineAtMs: number };
+type NativeMaterializableQuery = {
+  toArray(options?: { timeoutMs?: number }): Promise<Array<Record<string, unknown>>>;
+};
+
+function makeNativeQueryDeadline(timeoutMs: number | undefined): NativeQueryDeadline | undefined {
+  if (timeoutMs === undefined) return undefined;
+  const bounded = Math.floor(timeoutMs);
+  if (!Number.isFinite(bounded) || bounded <= 0) throw new NativeQueryTimeoutError();
+  return { deadlineAtMs: performance.now() + bounded };
+}
+
+function remainingNativeTimeoutMs(deadline: NativeQueryDeadline | undefined): number | undefined {
+  if (!deadline) return undefined;
+  const remaining = Math.floor(deadline.deadlineAtMs - performance.now());
+  if (remaining <= 0) throw new NativeQueryTimeoutError();
+  return Math.max(1, remaining);
+}
+
+async function materializeNativeQuery(
+  query: NativeMaterializableQuery,
+  deadline: NativeQueryDeadline | undefined,
+): Promise<Array<Record<string, unknown>>> {
+  const timeoutMs = remainingNativeTimeoutMs(deadline);
+  let rows: Array<Record<string, unknown>>;
+  try {
+    rows = timeoutMs === undefined
+      ? await query.toArray()
+      : await query.toArray({ timeoutMs });
+  } catch (error) {
+    if (deadline && (isNativeQueryTimeoutError(error) || performance.now() >= deadline.deadlineAtMs)) {
+      throw new NativeQueryTimeoutError({ cause: error, timeoutSource: isNativeQueryTimeoutError(error) ? "materialization_timeout" : "deadline_after_error" });
+    }
+    throw error;
+  }
+  if (deadline && performance.now() >= deadline.deadlineAtMs) throw new NativeQueryTimeoutError();
+  return rows;
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export interface MemoryEntry {
+  id: string;
+  text: string;
+  vector: number[];
+  category: "preference" | "fact" | "decision" | "entity" | "other";
+  scope: string;
+  importance: number;
+  timestamp: number;
+  metadata?: string; // JSON string for extensible metadata
+}
+
+export interface MemorySearchResult {
+  entry: MemoryEntry;
+  score: number;
+}
+
+type LegacyMemoryRow = Omit<MemoryEntry, "timestamp"> & {
+  timestamp?: number;
+};
+
+export interface StoreConfig {
+  dbPath: string;
+  vectorDim: number;
+  privateScoreProvenanceEnabled?: boolean;
+}
+
+export type NewMemoryEntry = Omit<MemoryEntry, "id" | "timestamp"> & {
+  id?: string;
+  timestamp?: number;
+};
+
+const SEARCH_ENTRY_COLUMNS = [
+  "id",
+  "text",
+  "category",
+  "scope",
+  "importance",
+  "timestamp",
+  "metadata",
+] as const;
+
+// ============================================================================
+// LanceDB Dynamic Import
+// ============================================================================
+
+let lancedbImportPromise: Promise<typeof import("@lancedb/lancedb")> | null =
+  null;
+
+export const loadLanceDB = async (): Promise<
+  typeof import("@lancedb/lancedb")
+> => {
+  if (!lancedbImportPromise) {
+    lancedbImportPromise = import("@lancedb/lancedb");
+  }
+  try {
+    return await lancedbImportPromise;
+  } catch (err) {
+    throw new Error(
+      `memory-lancedb-pro: failed to load LanceDB. ${String(err)}`,
+      { cause: err },
+    );
+  }
+};
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+function clampInt(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, Math.floor(value)));
+}
+
+function escapeSqlLiteral(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+// Lance's array-literal planner chooses the first literal's numeric type.
+// Keep every validated vector element a Float64 literal before the existing
+// column cast; this changes SQL spelling, not the supplied Number or vector.
+function vectorUpdateSqlLiteral(vector: number[]): string {
+  return `[${vector.map((value) => {
+    if (Object.is(value, -0)) return "-0.0";
+    const literal = value.toString();
+    return /[.eE]/.test(literal) ? literal : `${literal}.0`;
+  }).join(", ")}]`;
+}
+
+function partialUpdateSqlLiteral(value: string | number | number[]): string {
+  if (Array.isArray(value)) return vectorUpdateSqlLiteral(value);
+  if (typeof value === "string") return `'${escapeSqlLiteral(value)}'`;
+  if (typeof value === "number") return value.toString();
+  throw new TypeError("Unsupported memory update value type");
+}
+
+export function assertValidVector(vector: unknown, expectedDim: number): asserts vector is number[] {
+  if (!Array.isArray(vector) || vector.length !== expectedDim) {
+    throw new Error(
+      `Vector dimension mismatch: expected ${expectedDim}, got ${Array.isArray(vector) ? vector.length : "non-array"}`,
+    );
+  }
+  const invalidIndex = vector.findIndex((value) => typeof value !== "number" || !Number.isFinite(value));
+  if (invalidIndex >= 0) {
+    throw new Error(`Vector contains a non-finite number at index ${invalidIndex}`);
+  }
+  if (vector.some((value) => !Number.isFinite(Math.fround(value)))) {
+    throw new Error("Vector must remain finite after Float32 conversion");
+  }
+}
+
+// ============================================================================
+// Storage Path Validation
+// ============================================================================
+
+/**
+ * Validate and prepare the storage directory before LanceDB connection.
+ * Resolves symlinks, creates missing directories, and checks write permissions.
+ * Returns the resolved absolute path on success, or throws a descriptive error.
+ */
+export function validateStoragePath(dbPath: string): string {
+  let resolvedPath = dbPath;
+
+  // Resolve symlinks (including dangling symlinks)
+  try {
+    const stats = lstatSync(dbPath);
+    if (stats.isSymbolicLink()) {
+      try {
+        resolvedPath = realpathSync(dbPath);
+      } catch (err: any) {
+        throw new Error(
+          `dbPath "${dbPath}" is a symlink whose target does not exist.\n` +
+            `  Fix: Create the target directory, or update the symlink to point to a valid path.\n` +
+            `  Details: ${err.code || ""} ${err.message}`,
+        );
+      }
+    }
+  } catch (err: any) {
+    // Missing path is OK (it will be created below)
+    if (err?.code === "ENOENT") {
+      // no-op
+    } else if (
+      typeof err?.message === "string" &&
+      err.message.includes("symlink whose target does not exist")
+    ) {
+      throw err;
+    } else {
+      // Other lstat failures — continue with original path
+    }
+  }
+
+  // Create directory if it doesn't exist
+  if (!existsSync(resolvedPath)) {
+    try {
+      mkdirSync(resolvedPath, { recursive: true });
+    } catch (err: any) {
+      throw new Error(
+        `Failed to create dbPath directory "${resolvedPath}".\n` +
+          `  Fix: Ensure the parent directory "${dirname(resolvedPath)}" exists and is writable,\n` +
+          `       or create it manually: mkdir -p "${resolvedPath}"\n` +
+          `  Details: ${err.code || ""} ${err.message}`,
+      );
+    }
+  }
+
+  // Check write permissions
+  try {
+    accessSync(resolvedPath, constants.W_OK);
+  } catch (err: any) {
+    throw new Error(
+      `dbPath directory "${resolvedPath}" is not writable.\n` +
+        `  Fix: Check permissions with: ls -la "${dirname(resolvedPath)}"\n` +
+        `       Or grant write access: chmod u+w "${resolvedPath}"\n` +
+        `  Details: ${err.code || ""} ${err.message}`,
+    );
+  }
+
+  return resolvedPath;
+}
+
+// ============================================================================
+// Memory Store
+// ============================================================================
+
+export const DELETED_MEMORY_SCOPE = "__memory_deleted__" as const;
+
+const TABLE_NAME = "memories";
+const BACKUP_TABLE_NAME = "memories_backup_pre_timestamp_migration";
+
+let readStoreProof: (store:unknown,result:unknown)=>BranchScoreEvidence|null = ()=>null;
+export class MemoryStore {
+  private db: LanceDB.Connection | null = null;
+  private table: LanceDB.Table | null = null;
+  private initPromise: Promise<void> | null = null;
+  private ftsIndexCreated = false;
+  private supportsTimestamp = true;
+  // Tokens are created per coordinator query, never persisted or exposed.
+  private readonly bm25RecoverySessions = new WeakMap<object, {
+    identity: string;
+    table: LanceDB.Table | null;
+    version: number;
+    chunks: string[];
+    nextIndex: number;
+    fused: Map<string, MemorySearchResult & { fusion: number }>;
+  }>();
+
+  readonly #scoreEvidence: WeakMap<object,{evidence:BranchScoreEvidence;id:string;score:number}> | null;
+  constructor(private readonly config: StoreConfig) {
+    this.#scoreEvidence=config.privateScoreProvenanceEnabled===true?new WeakMap():null;
+  }
+  static {readStoreProof=(store:unknown,result:unknown):BranchScoreEvidence|null=>{
+    try {
+      if (!(store instanceof MemoryStore) || !store.#scoreEvidence || !result || typeof result!=="object") return null;
+      const issued=store.#scoreEvidence.get(result);
+      const current=result as MemorySearchResult;
+      if (!issued || current.entry.id!==issued.id || !Object.is(current.score,issued.score)) return null;
+      return freezePrivateCopy(issued.evidence);
+    } catch {return null;}
+  };}
+  #bindNativeScore(result:MemorySearchResult,raw:unknown,source:"vector"|"bm25",nativeRank:number,branchRank:number):void {
+    if (!this.#scoreEvidence) return;
+    this.#scoreEvidence.set(result,{id:result.entry.id,score:result.score,
+      evidence:captureNativeBranch(raw,source,result.score,nativeRank,branchRank)});
+  }
+
+  get dbPath(): string {
+    return this.config.dbPath;
+  }
+
+  private async ensureInitialized(): Promise<void> {
+    if (this.table) {
+      return;
+    }
+    if (this.initPromise) {
+      return this.initPromise;
+    }
+
+    this.initPromise = this.doInitialize().catch((err) => {
+      try {
+        this.db?.close();
+      } catch {
+        // Initialization already failed; state reset is the priority.
+      }
+      this.table = null;
+      this.db = null;
+      this.ftsIndexCreated = false;
+      this.supportsTimestamp = true;
+      this.initPromise = null;
+      throw err;
+    });
+    return this.initPromise;
+  }
+
+  private async doInitialize(): Promise<void> {
+    const lancedb = await loadLanceDB();
+
+    let db: LanceDB.Connection;
+    try {
+      db = await lancedb.connect(this.config.dbPath);
+    } catch (err: any) {
+      const code = err.code || "";
+      const message = err.message || String(err);
+      throw new Error(
+        `Failed to open LanceDB at "${this.config.dbPath}": ${code} ${message}\n` +
+          `  Fix: Verify the path exists and is writable. Check parent directory permissions.`,
+      );
+    }
+
+    this.db = db;
+    let table: LanceDB.Table;
+
+    const tableNames = await db.tableNames();
+    if (tableNames.includes(TABLE_NAME)) {
+      table = await db.openTable(TABLE_NAME);
+      this.supportsTimestamp = await this.tableHasTimestamp(table);
+      await this.migrateLegacyTableIfNeeded(table);
+      table = this.table!;
+
+      try {
+        const sample = await table.query().limit(1).toArray();
+        if (sample.length > 0 && !("scope" in sample[0])) {
+          console.warn(
+            "Adding scope column for backward compatibility with existing data",
+          );
+        }
+      } catch (err) {
+        console.warn("Could not check table schema", safeErrorDiagnostic(err, "schema_probe_failed"));
+      }
+    } else {
+      table = await this.createMemoryTable(TABLE_NAME);
+      this.supportsTimestamp = true;
+    }
+
+    const sample = await table.query().limit(1).toArray();
+    if (sample.length > 0 && sample[0]?.vector?.length) {
+      const existingDim = sample[0].vector.length;
+      if (existingDim !== this.config.vectorDim) {
+        throw new Error(
+          `Vector dimension mismatch: table=${existingDim}, config=${this.config.vectorDim}. Create a new table/dbPath or set matching embedding.dimensions.`,
+        );
+      }
+    }
+
+    try {
+      await this.createFtsIndex(table);
+      this.ftsIndexCreated = true;
+    } catch (err) {
+      console.warn(
+        "Failed to create FTS index; using vector-only search",
+        safeErrorDiagnostic(err, "fts_index_create_failed"),
+      );
+      this.ftsIndexCreated = false;
+    }
+
+    this.table = table;
+  }
+
+  private async createMemoryTable(name: string): Promise<LanceDB.Table> {
+    const table = await this.db!.createTable(name, [
+      {
+        id: "__schema__",
+        text: "",
+        vector: Array.from({ length: this.config.vectorDim }).fill(0) as number[],
+        category: "other",
+        scope: "global",
+        importance: 0,
+        timestamp: 0,
+        metadata: "{}",
+      } satisfies MemoryEntry,
+    ]);
+    await table.delete('id = "__schema__"');
+    return table;
+  }
+
+  private async readAllRows(table: LanceDB.Table): Promise<LegacyMemoryRow[]> {
+    const rows = await table.query().toArray();
+    return rows as LegacyMemoryRow[];
+  }
+
+  private async tableHasTimestamp(table: LanceDB.Table): Promise<boolean> {
+    const rows = await this.readAllRows(table);
+    if (rows.length === 0) return true;
+    return rows.every((row) => typeof row.timestamp === "number");
+  }
+
+  private normalizeMemoryRow(row: LegacyMemoryRow, fallbackTimestamp: number): MemoryEntry {
+    return {
+      id: row.id,
+      text: row.text,
+      vector: Array.from(row.vector as Iterable<number>),
+      category: row.category,
+      scope: row.scope ?? "global",
+      importance: Number(row.importance),
+      timestamp: typeof row.timestamp === "number" ? row.timestamp : fallbackTimestamp,
+      metadata: typeof row.metadata === "string" ? row.metadata : "{}",
+    };
+  }
+
+  private async recreateTable(name: string, rows: MemoryEntry[]): Promise<LanceDB.Table> {
+    throw new Error("memory_automatic_table_recreation_disabled");
+  }
+
+  private async restoreFromBackup(rows: MemoryEntry[]): Promise<void> {
+    this.table = await this.recreateTable(TABLE_NAME, rows);
+    this.supportsTimestamp = true;
+  }
+
+  private async migrateLegacyTableIfNeeded(table: LanceDB.Table): Promise<void> {
+    if (this.supportsTimestamp) {
+      this.table = table;
+      return;
+    }
+
+    throw new Error("memory_automatic_table_recreation_disabled");
+  }
+
+  private async createFtsIndex(table: LanceDB.Table): Promise<void> {
+    try {
+      // Check if FTS index already exists
+      const indices = await table.listIndices();
+      const hasFtsIndex = indices?.some(
+        (idx: any) => idx.indexType === "FTS" || idx.columns?.includes("text"),
+      );
+
+      if (!hasFtsIndex) {
+        // LanceDB @lancedb/lancedb >=0.26: use Index.fts() config
+        const lancedb = await loadLanceDB();
+        await table.createIndex("text", {
+          config: (lancedb as any).Index.fts(),
+          waitTimeoutSeconds: 30,
+        });
+      }
+    } catch (err) {
+      throw new Error(
+        `FTS index creation failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  async store(
+    entry: NewMemoryEntry,
+  ): Promise<MemoryEntry> {
+    assertValidVector(entry.vector, this.config.vectorDim);
+    await this.ensureInitialized();
+    const vector = Array.from(entry.vector as number[]);
+    assertValidVector(vector, this.config.vectorDim);
+
+    if (entry.id !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(entry.id)) {
+      throw new Error("Memory store requires a valid UUID when id is supplied");
+    }
+    if (entry.timestamp !== undefined && !Number.isFinite(entry.timestamp)) {
+      throw new Error("Memory store requires a finite timestamp when supplied");
+    }
+
+    const fullEntry: MemoryEntry = {
+      ...entry,
+      vector,
+      id: entry.id ?? randomUUID(),
+      timestamp: entry.timestamp ?? Date.now(),
+      metadata: entry.metadata || "{}",
+    };
+
+    try {
+      if (this.supportsTimestamp) {
+        await this.table!.add([fullEntry as unknown as Record<string, unknown>]);
+      } else {
+        const { timestamp: _timestamp, ...legacyEntry } = fullEntry;
+        await this.table!.add([legacyEntry]);
+      }
+    } catch (err: any) {
+      if (this.isMissingTimestampSchemaError(err)) {
+        this.supportsTimestamp = false;
+        const { timestamp: _timestamp, ...legacyEntry } = fullEntry;
+        await this.table!.add([legacyEntry]);
+      } else {
+        const code = err.code || "";
+        const message = err.message || String(err);
+        throw new Error(
+          `Failed to store memory in "${this.config.dbPath}": ${code} ${message}`,
+        );
+      }
+    }
+    return fullEntry;
+  }
+
+  private isMissingTimestampSchemaError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /timestamp/i.test(message) && /field not in schema/i.test(message);
+  }
+
+  /**
+   * Import a pre-built entry while preserving its id/timestamp.
+   * Used for re-embedding / migration / A/B testing across embedding models.
+   * Intentionally separate from `store()` to keep normal writes simple.
+   */
+  async importEntry(entry: MemoryEntry): Promise<MemoryEntry> {
+    assertValidVector(entry.vector || [], this.config.vectorDim);
+    await this.ensureInitialized();
+
+    if (!entry.id || typeof entry.id !== "string") {
+      throw new Error("importEntry requires a stable id");
+    }
+
+    const vector = Array.from(entry.vector || []);
+    assertValidVector(vector, this.config.vectorDim);
+
+    const full: MemoryEntry = {
+      ...entry,
+      vector,
+      scope: entry.scope || "global",
+      importance: Number.isFinite(entry.importance) ? entry.importance : 0.7,
+      timestamp: Number.isFinite(entry.timestamp)
+        ? entry.timestamp
+        : Date.now(),
+      metadata: entry.metadata || "{}",
+    };
+
+    await this.table!.add([full as unknown as Record<string, unknown>]);
+    return full;
+  }
+
+  async hasId(id: string): Promise<boolean> {
+    await this.ensureInitialized();
+    const safeId = escapeSqlLiteral(id);
+    const res = await this.table!.query()
+      .select(["id"])
+      .where(`id = '${safeId}'`)
+      .limit(1)
+      .toArray();
+    return res.length > 0;
+  }
+
+  /**
+   * Read a single memory entry by exact ID without any mutation.
+   * Unlike update(id, {}), this performs a pure read (no delete+add cycle).
+   */
+  async getById(id: string, nativeTimeoutMs?: number, includeVector = true): Promise<MemoryEntry | null> {
+    const nativeDeadline = makeNativeQueryDeadline(nativeTimeoutMs);
+    await this.ensureInitialized();
+    const safeId = escapeSqlLiteral(id);
+    let query = this.table!.query();
+    if (!includeVector) {
+      query = query.select(["id", "text", "category", "scope", "importance", "metadata",
+        ...(this.supportsTimestamp ? ["timestamp"] : [])]);
+    }
+    const rows = await materializeNativeQuery(
+      query.where(`id = '${safeId}'`).limit(1),
+      nativeDeadline,
+    );
+    if (rows.length === 0) return null;
+
+    const row = rows[0];
+    return {
+      id: row.id as string,
+      text: row.text as string,
+      vector: includeVector ? Array.from(row.vector as Iterable<number>) : [],
+      category: row.category as MemoryEntry["category"],
+      scope: (row.scope as string | undefined) ?? (includeVector ? "global" : ""),
+      importance: Number(row.importance),
+      timestamp: includeVector || this.supportsTimestamp ? Number(row.timestamp) : 0,
+      metadata: (row.metadata as string) || "{}",
+    };
+  }
+
+  async vectorSearch(
+    vector: number[],
+    limit = 5,
+    minScore = 0.3,
+    scopeFilter?: string[],
+    includeVector = true,
+    nativeTimeoutMs?: number,
+  ): Promise<MemorySearchResult[]> {
+    assertValidVector(vector, this.config.vectorDim);
+    const nativeDeadline = makeNativeQueryDeadline(nativeTimeoutMs);
+    await this.ensureInitialized();
+    assertValidVector(vector, this.config.vectorDim);
+
+    const safeLimit = clampInt(limit, 1, 20);
+    // The native predicate already removes every row the application guard can
+    // reject, so fetching beyond the requested rank only adds Arrow/JS pressure.
+    const fetchLimit = includeVector ? Math.min(safeLimit * 2, 40) : safeLimit;
+
+    let query = this.table!.vectorSearch(vector).limit(fetchLimit);
+    if (!includeVector) {
+      query = query.select([...SEARCH_ENTRY_COLUMNS, "_distance"]);
+    }
+
+    const visibleCondition = `(scope != '${escapeSqlLiteral(DELETED_MEMORY_SCOPE)}' OR scope IS NULL)`;
+    if (scopeFilter && scopeFilter.length > 0) {
+      const scopeConditions = scopeFilter
+        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+        .join(" OR ");
+      const legacyNullCondition = scopeFilter.includes("global")
+        ? " OR scope IS NULL"
+        : "";
+      query = query.where(
+        `${visibleCondition} AND ((${scopeConditions})${legacyNullCondition})`,
+      );
+    } else {
+      query = query.where(visibleCondition);
+    }
+
+    const results = await materializeNativeQuery(query, nativeDeadline);
+    const mapped: MemorySearchResult[] = [];
+
+    let privateNativeRank=0;
+    for (const row of results) {
+      if (this.#scoreEvidence) privateNativeRank+=1;
+      let privateRaw:unknown;
+      const distance = Number((this.#scoreEvidence?(privateRaw=row._distance):row._distance) ?? 0);
+      const score = 1 / (1 + distance);
+
+      if (score < minScore) continue;
+
+      const rowScope = (row.scope as string | undefined) ?? "global";
+      if (rowScope === DELETED_MEMORY_SCOPE) continue;
+
+      // Double-check scope filter in application layer
+      if (
+        scopeFilter &&
+        scopeFilter.length > 0 &&
+        !scopeFilter.includes(rowScope)
+      ) {
+        continue;
+      }
+
+      mapped.push({
+        entry: {
+          id: row.id as string,
+          text: row.text as string,
+          vector: includeVector ? Array.from(row.vector as Iterable<number>) : [],
+          category: row.category as MemoryEntry["category"],
+          scope: rowScope,
+          importance: Number(row.importance),
+          timestamp: Number.isFinite(Number(row.timestamp)) ? Number(row.timestamp) : 0,
+          metadata: (row.metadata as string) || "{}",
+        },
+        score,
+      });
+
+      if (this.#scoreEvidence) this.#bindNativeScore(mapped[mapped.length-1],privateRaw,"vector",privateNativeRank,mapped.length);
+      if (mapped.length >= safeLimit) break;
+    }
+
+    return mapped;
+  }
+  private async runBm25Search(
+    query: string,
+    limit = 5,
+    scopeFilter?: string[],
+    includeVector = true,
+    nativeDeadline?: NativeQueryDeadline,
+  ): Promise<MemorySearchResult[]> {
+    const safeLimit = clampInt(limit, 1, 20);
+    // The native predicate already removes every row the application guard can
+    // reject, so fetching beyond the requested rank only adds Arrow/JS pressure.
+    const fetchLimit = includeVector ? Math.min(safeLimit * 2, 40) : safeLimit;
+
+    // Use FTS query type explicitly and omit the 1024-d vector payload when the
+    // coordinator needs only fusion metadata.
+    let searchQuery = this.table!.search(query, "fts").limit(fetchLimit);
+    if (!includeVector) {
+      searchQuery = searchQuery.select([...SEARCH_ENTRY_COLUMNS, "_score"]);
+    }
+
+    // Prefilter tombstones so their unbounded lifetime cannot crowd active
+    // memories out of the bounded native result set. Retain the application
+    // filter below as a fail-closed second boundary.
+    const visibleCondition = `(scope != '${escapeSqlLiteral(DELETED_MEMORY_SCOPE)}' OR scope IS NULL)`;
+    if (scopeFilter && scopeFilter.length > 0) {
+      const scopeConditions = scopeFilter
+        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+        .join(" OR ");
+      const legacyNullCondition = scopeFilter.includes("global")
+        ? " OR scope IS NULL"
+        : "";
+      searchQuery = searchQuery.where(
+        `${visibleCondition} AND ((${scopeConditions})${legacyNullCondition})`,
+      );
+    } else {
+      searchQuery = searchQuery.where(visibleCondition);
+    }
+
+    const results = await materializeNativeQuery(searchQuery, nativeDeadline);
+    const mapped: MemorySearchResult[] = [];
+
+    let privateNativeRank=0;
+    for (const row of results) {
+      if (this.#scoreEvidence) privateNativeRank+=1;
+      const rowScope = (row.scope as string | undefined) ?? "global";
+      if (rowScope === DELETED_MEMORY_SCOPE) continue;
+
+      // Double-check scope filter in application layer
+      if (
+        scopeFilter &&
+        scopeFilter.length > 0 &&
+        !scopeFilter.includes(rowScope)
+      ) {
+        continue;
+      }
+
+      // LanceDB FTS _score is raw BM25 (unbounded). Normalize with sigmoid.
+      // LanceDB may return BigInt for numeric columns; coerce safely.
+      let privateRaw:unknown;
+      const rawScore = row._score != null ? Number(this.#scoreEvidence?(privateRaw=row._score):row._score) : 0;
+      const normalizedScore =
+        rawScore > 0 ? 1 / (1 + Math.exp(-rawScore / 5)) : 0.5;
+
+      mapped.push({
+        entry: {
+          id: row.id as string,
+          text: row.text as string,
+          vector: includeVector ? Array.from(row.vector as Iterable<number>) : [],
+          category: row.category as MemoryEntry["category"],
+          scope: rowScope,
+          importance: Number(row.importance),
+          timestamp: Number.isFinite(Number(row.timestamp)) ? Number(row.timestamp) : 0,
+          metadata: (row.metadata as string) || "{}",
+        },
+        score: normalizedScore,
+      });
+      if (this.#scoreEvidence) this.#bindNativeScore(mapped[mapped.length-1],privateRaw,"bm25",privateNativeRank,mapped.length);
+      if (mapped.length >= safeLimit) break;
+    }
+
+    return mapped;
+  }
+
+  private isRecoverableLongFtsError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /Arrow error:\s+(?:Invalid argument error:\s+)?all columns in a record batch must have the same length/iu.test(message);
+  }
+
+  private longFtsRecoveryChunks(query: string): string[] {
+    const compact = [...query.normalize("NFKC").replace(/[\p{P}\p{S}\s]+/gu, "")];
+    if (compact.length <= 12) return [];
+    const chunks: string[] = [];
+    for (let offset = 0; offset < compact.length; offset += 8) {
+      const chunk = compact.slice(offset, offset + 12).join("");
+      if ([...chunk].length >= 2 && !chunks.includes(chunk)) chunks.push(chunk);
+      if (offset + 12 >= compact.length) break;
+    }
+    const suffix = compact.slice(-12).join("");
+    if ([...suffix].length >= 2 && !chunks.includes(suffix)) chunks.push(suffix);
+    return chunks;
+  }
+
+  private async bm25RecoveryVersion(nativeDeadline: NativeQueryDeadline | undefined): Promise<number | null> {
+    remainingNativeTimeoutMs(nativeDeadline);
+    const table = this.table;
+    if (!table || typeof table.version !== "function") return null;
+    const version = await table.version();
+    remainingNativeTimeoutMs(nativeDeadline);
+    if (this.table !== table) throw new Error("bm25_recovery_generation_changed");
+    if (!Number.isSafeInteger(version) || version < 0) throw new Error("bm25_recovery_version_invalid");
+    return version;
+  }
+
+  private async recoverLongFtsQuery(
+    query: string,
+    limit: number,
+    scopeFilter: string[] | undefined,
+    includeVector: boolean,
+    nativeDeadline: NativeQueryDeadline | undefined,
+    recoveryToken?: object,
+  ): Promise<{ results: MemorySearchResult[]; chunkCount: number }> {
+    const identity = JSON.stringify([query, limit, scopeFilter ?? null, includeVector]);
+    const prior = recoveryToken ? this.bm25RecoverySessions.get(recoveryToken) : undefined;
+    if (prior && (prior.identity !== identity || prior.table !== this.table)) {
+      this.bm25RecoverySessions.delete(recoveryToken!);
+      throw new Error("bm25_recovery_session_mismatch");
+    }
+    if (recoveryToken) remainingNativeTimeoutMs(nativeDeadline);
+    const version = recoveryToken ? await this.bm25RecoveryVersion(nativeDeadline) : null;
+    if (prior && (version === null || prior.version !== version)) {
+      this.bm25RecoverySessions.delete(recoveryToken!);
+      throw new Error("bm25_recovery_generation_changed");
+    }
+    // Without a verifiable table generation, retain legacy per-attempt behavior.
+    if (version === null) recoveryToken = undefined;
+    const session = prior ?? {
+      identity, table: this.table, version: version ?? 0,
+      chunks: this.longFtsRecoveryChunks(query), nextIndex: 0,
+      fused: new Map<string, MemorySearchResult & { fusion: number }>(),
+    };
+    const { chunks } = session;
+    if (chunks.length === 0) throw new Error("Long FTS recovery requires a splittable query");
+    if (recoveryToken && !prior) this.bm25RecoverySessions.set(recoveryToken, session);
+    const assertGeneration = async (): Promise<void> => {
+      if (!recoveryToken) return;
+      if (this.table !== session.table || await this.bm25RecoveryVersion(nativeDeadline) !== session.version) {
+        this.bm25RecoverySessions.delete(recoveryToken);
+        throw new Error("bm25_recovery_generation_changed");
+      }
+      remainingNativeTimeoutMs(nativeDeadline);
+    };
+    for (; session.nextIndex < chunks.length;) {
+      await assertGeneration();
+      const chunk = chunks[session.nextIndex];
+      const results = await this.runBm25Search(
+        chunk,
+        Math.min(20, Math.max(limit * 2, limit)),
+        scopeFilter,
+        includeVector,
+        nativeDeadline,
+      );
+      // Stage the whole chunk; no late completion or changed generation is committed.
+      const fused = new Map([...session.fused].map(([id, value]) => [id, { ...value }]));
+      results.forEach((result, rank) => {
+        const current = fused.get(result.entry.id);
+        const fusion = (current?.fusion ?? 0) + (1 / (60 + rank + 1));
+        if (!current || result.score > current.score) {
+          fused.set(result.entry.id, { ...result, fusion });
+        } else {
+          current.fusion = fusion;
+        }
+      });
+      await assertGeneration();
+      session.fused = fused;
+      session.nextIndex += 1;
+    }
+    if (recoveryToken) this.bm25RecoverySessions.delete(recoveryToken);
+    return {
+      results: [...session.fused.values()]
+        .sort((a, b) => b.fusion - a.fusion || b.score - a.score || b.entry.timestamp - a.entry.timestamp)
+        .slice(0, clampInt(limit, 1, 20))
+        .map(({ fusion: _fusion, ...result },index) => {
+          if (this.#scoreEvidence) this.#scoreEvidence.set(result,{id:result.entry.id,score:result.score,
+            evidence:unknownBranch("bm25",result.score,index+1,"chunked_recovery_raw_unavailable")});
+          return result;
+        }),
+      chunkCount: chunks.length,
+    };
+  }
+
+  async bm25SearchWithStatus(
+    query: string,
+    limit = 5,
+    scopeFilter?: string[],
+    includeVector = true,
+    nativeTimeoutMs?: number,
+    recoveryToken?: object,
+  ): Promise<{
+    status: "ok" | "unavailable" | "error";
+    results: MemorySearchResult[];
+    error?: "fts_index_unavailable" | "bm25_native_error" | "bm25_native_timeout";
+    error_type?: SafeErrorType;
+    error_digest?: string;
+    native_timeout?: boolean;
+    timeout_stage?: "query" | "recovery";
+    timeout_source?: NativeTimeoutSource;
+    recovery?: {
+      mode: "chunked-query";
+      original_error: "arrow_record_batch_length";
+      chunk_count: number;
+      deduplicated_results: number;
+    };
+  }> {
+    if (recoveryToken !== undefined && (recoveryToken === null || typeof recoveryToken !== "object")) {
+      throw new TypeError("invalid_bm25_recovery_token");
+    }
+    const nativeDeadline = makeNativeQueryDeadline(nativeTimeoutMs);
+    await this.ensureInitialized();
+    if (!this.ftsIndexCreated) {
+      return {
+        status: "unavailable",
+        results: [],
+        error: "fts_index_unavailable",
+      };
+    }
+    const resuming = Boolean(recoveryToken && this.bm25RecoverySessions.has(recoveryToken));
+    try {
+      if (resuming) {
+        const recovered = await this.recoverLongFtsQuery(query, limit, scopeFilter, includeVector, nativeDeadline, recoveryToken);
+        return { status: "ok", results: recovered.results, recovery: {
+          mode: "chunked-query", original_error: "arrow_record_batch_length",
+          chunk_count: recovered.chunkCount, deduplicated_results: recovered.results.length,
+        } };
+      }
+      return {
+        status: "ok",
+        results: await this.runBm25Search(query, limit, scopeFilter, includeVector, nativeDeadline),
+      };
+    } catch (err) {
+      if (!resuming && this.isRecoverableLongFtsError(err)) {
+        try {
+          const recovered = await this.recoverLongFtsQuery(
+            query,
+            limit,
+            scopeFilter,
+            includeVector,
+            nativeDeadline,
+            recoveryToken,
+          );
+          return {
+            status: "ok",
+            results: recovered.results,
+            recovery: {
+              mode: "chunked-query",
+              original_error: "arrow_record_batch_length",
+              chunk_count: recovered.chunkCount,
+              deduplicated_results: recovered.results.length,
+            },
+          };
+        } catch (recoveryError) {
+          if (isNativeQueryTimeoutError(recoveryError)) {
+            const diagnostic = safeErrorDiagnostic(recoveryError, "bm25_native_timeout");
+            return {
+              status: "error",
+              results: [],
+              error: "bm25_native_timeout",
+              error_type: diagnostic.type,
+              error_digest: diagnostic.digest,
+              native_timeout: true,
+              timeout_stage: "recovery",
+              timeout_source: recoveryError instanceof NativeQueryTimeoutError ? recoveryError.timeoutSource : "unknown",
+            };
+          }
+          if (recoveryToken) this.bm25RecoverySessions.delete(recoveryToken);
+          // Preserve the original exact failure class if bounded recovery fails.
+        }
+      }
+      if (isNativeQueryTimeoutError(err)) {
+        const diagnostic = safeErrorDiagnostic(err, "bm25_native_timeout");
+        return {
+          status: "error",
+          results: [],
+          error: "bm25_native_timeout",
+          error_type: diagnostic.type,
+          error_digest: diagnostic.digest,
+          native_timeout: true,
+          timeout_stage: resuming ? "recovery" : "query",
+          timeout_source: err instanceof NativeQueryTimeoutError ? err.timeoutSource : "unknown",
+        };
+      }
+      if (recoveryToken) this.bm25RecoverySessions.delete(recoveryToken);
+      const diagnostic = safeErrorDiagnostic(err, "bm25_native_error");
+      return {
+        status: "error",
+        results: [],
+        error: "bm25_native_error",
+        error_type: diagnostic.type,
+        error_digest: diagnostic.digest,
+      };
+    }
+  }
+
+  async bm25Search(
+    query: string,
+    limit = 5,
+    scopeFilter?: string[],
+    includeVector = true,
+    nativeTimeoutMs?: number,
+  ): Promise<MemorySearchResult[]> {
+    const outcome = await this.bm25SearchWithStatus(
+      query,
+      limit,
+      scopeFilter,
+      includeVector,
+      nativeTimeoutMs,
+    );
+    if (outcome.status === "error") {
+      console.warn("BM25 search failed; returning empty results", {
+        code: outcome.error ?? "bm25_native_error",
+        type: outcome.error_type ?? "Error",
+        digest: outcome.error_digest ?? "unavailable",
+      });
+    }
+    return outcome.results;
+  }
+  async delete(id: string, scopeFilter?: string[]): Promise<boolean> {
+    await this.ensureInitialized();
+
+    // Support both full UUID and short prefix (8+ hex chars)
+    const uuidRegex =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const prefixRegex = /^[0-9a-f]{8,}$/i;
+    const isFullId = uuidRegex.test(id);
+    const isPrefix = !isFullId && prefixRegex.test(id);
+
+    if (!isFullId && !isPrefix) {
+      throw new Error(`Invalid memory ID format: ${id}`);
+    }
+
+    let candidates: any[];
+    if (isFullId) {
+      candidates = await this.table!.query()
+        .where(`id = '${id}'`)
+        .limit(1)
+        .toArray();
+    } else {
+      // Prefix match: fetch candidates and filter in app layer
+      const all = await this.table!.query()
+        .select(["id", "scope"])
+        .toArray();
+      candidates = all.filter((r: any) => (r.id as string).startsWith(id));
+      if (candidates.length > 1) {
+        throw new Error(
+          `Ambiguous prefix "${id}" matches ${candidates.length} memories. Use a longer prefix or full ID.`,
+        );
+      }
+    }
+    if (candidates.length === 0) {
+      return false;
+    }
+
+    const resolvedId = candidates[0].id as string;
+    const rowScope = (candidates[0].scope as string | undefined) ?? "global";
+
+    // Check scope permissions
+    if (
+      scopeFilter &&
+      scopeFilter.length > 0 &&
+      !scopeFilter.includes(rowScope)
+    ) {
+      throw new Error(`Memory ${resolvedId} is outside accessible scopes`);
+    }
+
+    await this.table!.delete(`id = '${resolvedId}'`);
+    return true;
+  }
+
+  async list(
+    scopeFilter?: string[],
+    category?: string,
+    limit = 20,
+    offset = 0,
+    includeDeleted = false,
+  ): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+
+    let query = this.table!.query();
+
+    // Build where conditions
+    const conditions: string[] = [];
+
+    if (scopeFilter && scopeFilter.length > 0) {
+      const scopeConditions = scopeFilter
+        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+        .join(" OR ");
+      conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
+    }
+
+    if (category) {
+      conditions.push(`category = '${escapeSqlLiteral(category)}'`);
+    }
+
+    if (conditions.length > 0) {
+      query = query.where(conditions.join(" AND "));
+    }
+
+    // Fetch all matching rows (no pre-limit) so app-layer sort is correct across full dataset
+    const results = await query
+      .select([
+        "id",
+        "text",
+        "category",
+        "scope",
+        "importance",
+        "timestamp",
+        "metadata",
+      ])
+      .toArray();
+
+    return results
+      .map(
+        (row): MemoryEntry => ({
+          id: row.id as string,
+          text: row.text as string,
+          vector: [], // Don't include vectors in list results for performance
+          category: row.category as MemoryEntry["category"],
+          scope: (row.scope as string | undefined) ?? "global",
+          importance: Number(row.importance),
+          timestamp: Number(row.timestamp),
+          metadata: (row.metadata as string) || "{}",
+        }),
+      )
+      .filter((entry) => includeDeleted || entry.scope !== DELETED_MEMORY_SCOPE)
+      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+      .slice(offset, offset + limit);
+  }
+
+  async stats(scopeFilter?: string[]): Promise<{
+    totalCount: number;
+    scopeCounts: Record<string, number>;
+    categoryCounts: Record<string, number>;
+  }> {
+    await this.ensureInitialized();
+
+    let query = this.table!.query();
+
+    if (scopeFilter && scopeFilter.length > 0) {
+      const scopeConditions = scopeFilter
+        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+        .join(" OR ");
+      query = query.where(`((${scopeConditions}) OR scope IS NULL)`);
+    }
+
+    const results = await query.select(["scope", "category"]).toArray();
+
+    const scopeCounts: Record<string, number> = {};
+    const categoryCounts: Record<string, number> = {};
+
+    let totalCount = 0;
+    for (const row of results) {
+      const scope = (row.scope as string | undefined) ?? "global";
+      if (scope === DELETED_MEMORY_SCOPE) continue;
+      totalCount += 1;
+      const category = row.category as string;
+
+      scopeCounts[scope] = (scopeCounts[scope] || 0) + 1;
+      categoryCounts[category] = (categoryCounts[category] || 0) + 1;
+    }
+
+    return {
+      totalCount,
+      scopeCounts,
+      categoryCounts,
+    };
+  }
+
+  async update(
+    id: string,
+    updates: {
+      text?: string;
+      vector?: number[];
+      importance?: number;
+      category?: MemoryEntry["category"];
+      scope?: string;
+      metadata?: string;
+    },
+    scopeFilter?: string[],
+  ): Promise<MemoryEntry | null> {
+    if (updates.vector != null) assertValidVector(updates.vector, this.config.vectorDim);
+    await this.ensureInitialized();
+
+    // Support both full UUID and short prefix (8+ hex chars), same as delete()
+    const uuidRegex =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const prefixRegex = /^[0-9a-f]{8,}$/i;
+    const isFullId = uuidRegex.test(id);
+    const isPrefix = !isFullId && prefixRegex.test(id);
+
+    if (!isFullId && !isPrefix) {
+      throw new Error(`Invalid memory ID format: ${id}`);
+    }
+
+    let rows: any[];
+    if (isFullId) {
+      const safeId = escapeSqlLiteral(id);
+      rows = await this.table!.query()
+        .where(`id = '${safeId}'`)
+        .limit(1)
+        .toArray();
+    } else {
+      // Prefix match
+      const all = await this.table!.query()
+        .select([
+          "id",
+          "text",
+          "vector",
+          "category",
+          "scope",
+          "importance",
+          "timestamp",
+          "metadata",
+        ])
+        .toArray();
+      rows = all.filter((r: any) => (r.id as string).startsWith(id));
+      if (rows.length > 1) {
+        throw new Error(
+          `Ambiguous prefix "${id}" matches ${rows.length} memories. Use a longer prefix or full ID.`,
+        );
+      }
+    }
+
+    if (rows.length === 0) return null;
+
+    const row = rows[0];
+    const rowScope = (row.scope as string | undefined) ?? "global";
+
+    // Check scope permissions
+    if (
+      scopeFilter &&
+      scopeFilter.length > 0 &&
+      !scopeFilter.includes(rowScope)
+    ) {
+      throw new Error(`Memory ${id} is outside accessible scopes`);
+    }
+
+    // Build updated entry, preserving original timestamp
+    const updated: MemoryEntry = {
+      id: row.id as string,
+      text: updates.text ?? (row.text as string),
+      vector: updates.vector ?? Array.from(row.vector as Iterable<number>),
+      category: updates.category ?? (row.category as MemoryEntry["category"]),
+      scope: updates.scope ?? rowScope,
+      importance: updates.importance ?? Number(row.importance),
+      timestamp: Number(row.timestamp), // preserve original
+      metadata: updates.metadata ?? ((row.metadata as string) || "{}"),
+    };
+    assertValidVector(updated.vector, this.config.vectorDim);
+
+    // LanceDB 0.27+ supports a native filtered update. Use one database commit
+    // instead of delete + add so a failed replacement cannot erase the row.
+    const resolvedId = escapeSqlLiteral(row.id as string);
+    // Do not reserialize untouched fields, especially an existing vector.
+    const values: Record<string, string | number | number[]> = {};
+    for (const field of ["text", "vector", "category", "scope", "importance", "metadata"] as const) {
+      if (updates[field] !== undefined) values[field] = updated[field] ?? "{}";
+    }
+    if (Object.keys(values).length === 0) return updated;
+    const where = `id = '${resolvedId}'`;
+    const result = Object.hasOwn(values, "vector")
+      ? await this.table!.update({
+        where,
+        valuesSql: Object.fromEntries(Object.entries(values).map(
+          ([field, value]) => [field, partialUpdateSqlLiteral(value)],
+        )),
+      })
+      : await this.table!.update({ where, values });
+    if (result.rowsUpdated !== 1) {
+      throw new Error(
+        `Memory update integrity check failed for ${updated.id}: expected 1 row, updated ${result.rowsUpdated}`,
+      );
+    }
+
+    return updated;
+  }
+
+  async bulkDelete(
+    scopeFilter: string[],
+    beforeTimestamp?: number,
+  ): Promise<number> {
+    await this.ensureInitialized();
+
+    const conditions: string[] = [];
+
+    if (scopeFilter.length > 0) {
+      const scopeConditions = scopeFilter
+        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+        .join(" OR ");
+      conditions.push(`(${scopeConditions})`);
+    }
+
+    if (beforeTimestamp) {
+      conditions.push(`timestamp < ${beforeTimestamp}`);
+    }
+
+    if (conditions.length === 0) {
+      throw new Error(
+        "Bulk delete requires at least scope or timestamp filter for safety",
+      );
+    }
+
+    const whereClause = conditions.join(" AND ");
+
+    // Count first
+    const countResults = await this.table!.query().where(whereClause).toArray();
+    const deleteCount = countResults.length;
+
+    // Then delete
+    if (deleteCount > 0) {
+      await this.table!.delete(whereClause);
+    }
+
+    return deleteCount;
+  }
+
+  get hasFtsSupport(): boolean {
+    return this.ftsIndexCreated;
+  }
+}
+
+// Read-only internal consumer seam; object identity is checked by the genuine store.
+export function readPrivateStoreScoreEvidence(store:unknown,result:unknown):BranchScoreEvidence|null {return readStoreProof(store,result);}

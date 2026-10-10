@@ -1,0 +1,3 @@
+# Store and check out text files with LF on every platform; byte-level checks such as
+# third_party/*/verify_upstream.py depend on it. Git still detects binary files.
+* text=auto eol=lf

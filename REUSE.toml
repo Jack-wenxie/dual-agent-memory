@@ -1,0 +1,25 @@
+version = 1
+
+# Everything not listed below: this project's own work.
+[[annotations]]
+path = "**"
+SPDX-FileCopyrightText = "2026 Jack-wenxie"
+SPDX-License-Identifier = "MIT"
+
+# The last matching table wins, so the upstream entries below override the default above.
+# Upstream memory-lancedb-pro 1.0.32 declares MIT and the author win4r but ships no copyright line.
+[[annotations]]
+path = "third_party/memory-lancedb-pro-1.0.32/pristine/src/store.ts"
+SPDX-FileCopyrightText = "memory-lancedb-pro 1.0.32, declared author win4r"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = [
+  "lancedb-memory-host/memory-lancedb-pro/src/store.ts",
+  "third_party/memory-lancedb-pro-1.0.32/patches/0001-store.patch",
+]
+SPDX-FileCopyrightText = [
+  "memory-lancedb-pro 1.0.32, declared author win4r",
+  "2026 Jack-wenxie",
+]
+SPDX-License-Identifier = "MIT"

@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0.0",
+  "aliases": [
+    {
+      "entity": "Demo handbook",
+      "alias": "dh",
+      "root_id": "workflow_root",
+      "relative_path": "fixtures/handbook.md",
+      "source": "curated_short_alias",
+      "score": 1
+    }
+  ]
+}

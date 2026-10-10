@@ -1,0 +1,39 @@
+{
+ "schema": "dual-agent-memory-third-party/v1",
+ "name": "memory-lancedb-pro",
+ "version": "1.0.32",
+ "source": "https://registry.npmjs.org/memory-lancedb-pro/-/memory-lancedb-pro-1.0.32.tgz",
+ "tarball": {
+  "bytes": 101025,
+  "sha1": "bf593c98dc7bec240d99364be6e481921bdfdb63",
+  "integrity": "sha512-bSNnzQ5g7wH5xIsToDiPIvuZJUELRPJ/QR26St0IpyileeSyJ7ei9Uri5Bpc9kw9x29J0N2iqPuf9ZBI3h9Y4g=="
+ },
+ "repository": {
+  "url": "https://github.com/CortexReach/memory-lancedb-pro",
+  "tag": "v1.0.32",
+  "commit": "eeb58e7a3a80ad9782dc80853c07afbf2dbb108b",
+  "note": "the package was first published under the win4r account"
+ },
+ "declared_license": "MIT",
+ "declared_author": "win4r",
+ "license_text_distributed_upstream": false,
+ "license_note": "package.json declares MIT and author win4r; neither the 1.0.32 tarball nor the v1.0.32 tag contains a LICENSE file, so no copyright line is reproduced.",
+ "vendored": [
+  {
+   "upstream_path": "package/src/store.ts",
+   "pristine_path": "third_party/memory-lancedb-pro-1.0.32/pristine/src/store.ts",
+   "pristine_sha256": "1f92a58e1e1529dc9d9b005c5d322090e514a69a4efa822f271e5e4760fbac95",
+   "patch_path": "third_party/memory-lancedb-pro-1.0.32/patches/0001-store.patch",
+   "patch_sha256": "2f733d45c135ca5be2b49ddce36101980feb148864f895e0c522143690cedd60",
+   "public_path": "lancedb-memory-host/memory-lancedb-pro/src/store.ts",
+   "public_sha256": "9dddcbf80684690e3d9f446a6d9d41b7ffbd1cc79e0a7958f40d8179a1e8a7d3"
+  }
+ ],
+ "added_by_this_project": [
+  {
+   "path": "lancedb-memory-host/memory-lancedb-pro/src/private-score-provenance.ts",
+   "sha256": "755b0d854cf28e6b7e0b3cf0d3e814aba192bc3d1e9f3c13fa0e8bd07d7c3bb3"
+  }
+ ],
+ "not_shipped": "The other 31 files of the upstream package are not shipped; the host imports only src/store.ts."
+}

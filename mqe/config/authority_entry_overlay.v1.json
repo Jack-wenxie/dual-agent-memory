@@ -1,0 +1,30 @@
+{
+  "schema_version": "authority-entry-overlay/1.0.0",
+  "routes": [
+    {
+      "route_id": "demo-status",
+      "project_id": "demo-project",
+      "intent": "status",
+      "aliases": [
+        "demo project",
+        "sample project"
+      ],
+      "root_id": "workflow_root",
+      "relative_path": "fixtures/project-status.md",
+      "section": "# Demo project",
+      "entry_label": "Demo project progress",
+      "entry_rows": [
+        {
+          "alias_norm": "demo project",
+          "row_id": "demo-status:5285f6adac9c"
+        },
+        {
+          "alias_norm": "sample project",
+          "row_id": "demo-status:98816fc4c6e5"
+        }
+      ],
+      "entry_audit": "sha256:fcafdbdcf2678c470bc1052efc3ba64ccd7975c69948036c6263ebeb81b63084",
+      "entry_audited": true
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "@dual-agent-memory/mqe",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.15.0" },
+  "dependencies": { "@modelcontextprotocol/sdk": "1.27.1" },
+  "scripts": {
+    "test": "npm run test:public",
+    "test:public": "node --test --test-concurrency=1 test/evidence-pack-v2.test.mjs test/public-source-roots.test.mjs test/public-fixtures/smoke.test.mjs test/public-eval.test.mjs",
+    "fixtures:mqe": "node test/public-fixtures/generate.mjs",
+    "fixtures:eval": "node eval/fixtures/generate.mjs",
+    "eval:synthetic": "node eval/batch_eval.mjs"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "max_query_chars": 512,
+  "max_candidates": 12,
+  "max_evidence_cards": 3,
+  "deadline_ms": 250,
+  "absolute_floor": 0.58,
+  "top1_margin": 0.08,
+  "exact_alias_floor": 0.9,
+  "exact_entity_floor": 0.9,
+  "short_query_max_chars": 2,
+  "safe_excerpt_max_chars": 240,
+  "status_terms": [
+    "status",
+    "progress"
+  ],
+  "authority_entry_enabled": false
+}

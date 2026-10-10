@@ -1,0 +1,12 @@
+{
+  "schema_version": "mqe-source-roots/v1",
+  "roots": {
+    "shared_primary": "sources/shared_primary",
+    "cc_active": "sources/peer",
+    "phd_hub": "sources/notes",
+    "workflow_root": ".",
+    "codex_home": "sources/primary-home",
+    "claude_home": "sources/peer-home",
+    "sport_vault": "sources/navigation"
+  }
+}

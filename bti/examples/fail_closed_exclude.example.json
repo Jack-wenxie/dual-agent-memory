@@ -1,0 +1,7 @@
+{
+  "_meta": {
+    "redactor": "example",
+    "note": "List session files or ids that must never be linked. Keys are paths or ids; values may carry a path and a reason."
+  },
+  "excluded": {}
+}

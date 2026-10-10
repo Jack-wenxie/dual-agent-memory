@@ -1,0 +1,174 @@
+# Hosted candidate: commit-pinned actions, reviewed locks and synthetic tests only.
+name: Windows synthetic public tests
+on:
+  pull_request:
+  push:
+permissions:
+  contents: read
+jobs:
+  mqe-synthetic:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: mqe
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Require a pinned dependency lock
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath 'package-lock.json')) { throw 'LOCKFILE_REQUIRED' }
+          if ((Test-Path -LiteralPath '.npmrc') -or (Test-Path -LiteralPath '../.npmrc')) { throw 'UNREVIEWED_NPM_CONFIG' }
+          $manifest = Get-Content -LiteralPath 'package.json' -Raw | ConvertFrom-Json -AsHashtable
+          $lock = Get-Content -LiteralPath 'package-lock.json' -Raw | ConvertFrom-Json -AsHashtable
+          if ($lock.lockfileVersion -ne 3) { throw 'LOCKFILE_VERSION_UNSUPPORTED' }
+          if ($lock.name -ne $manifest.name -or $lock.version -ne $manifest.version) { throw 'LOCKFILE_IDENTITY_MISMATCH' }
+          $root = $lock.packages['']
+          if ($null -eq $root -or $root.dependencies.'@modelcontextprotocol/sdk' -ne '1.27.1' -or $manifest.dependencies.'@modelcontextprotocol/sdk' -ne '1.27.1') { throw 'SDK_VERSION_NOT_PINNED' }
+          foreach ($entry in $lock.packages.GetEnumerator()) {
+            if ($entry.Key -eq '') { continue }
+            if ($entry.Value.link -eq $true -or -not $entry.Value.integrity -or $entry.Value.resolved -notmatch '^https://registry[.]npmjs[.]org/') { throw 'UNREVIEWED_DEPENDENCY_SOURCE' }
+          }
+      - name: Set up pinned Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.15.0'
+          # No dependency cache is restored or shared across fork PRs.
+      - name: Install exactly the lock without dependency lifecycle scripts
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm ci --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw 'LOCKED_INSTALL_FAILED' }
+      - name: Run the selected synthetic suite
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Hosted RUNNER_TEMP is expected to be short. Enforce the native Windows path budget.
+          $testTemp = Join-Path $env:RUNNER_TEMP ("dam-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+          if ($testTemp.Length -gt 70) { throw 'SYNTHETIC_TEMP_TOO_LONG' }
+          New-Item -ItemType Directory -Path $testTemp | Out-Null
+          $env:TEMP = $testTemp
+          $env:TMP = $testTemp
+          $env:TMPDIR = $testTemp
+          npm run test:public
+          if ($LASTEXITCODE -ne 0) { throw 'PUBLIC_SYNTHETIC_TEST_FAILED' }
+  host-synthetic:
+    # Serialize remote setup/install work until a provider quota envelope is declared.
+    needs: mqe-synthetic
+    # Keep collecting suite results after an earlier failure, but respect cancellation.
+    if: ${{ !cancelled() }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: lancedb-memory-host
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Require the reviewed host lock
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath 'package-lock.json')) { throw 'LOCKFILE_REQUIRED' }
+          if ((Test-Path -LiteralPath '.npmrc') -or (Test-Path -LiteralPath '../.npmrc')) { throw 'UNREVIEWED_NPM_CONFIG' }
+          $manifest = Get-Content -LiteralPath 'package.json' -Raw | ConvertFrom-Json -AsHashtable
+          $lock = Get-Content -LiteralPath 'package-lock.json' -Raw | ConvertFrom-Json -AsHashtable
+          if ($lock.lockfileVersion -ne 3) { throw 'LOCKFILE_VERSION_UNSUPPORTED' }
+          if ($lock.name -ne $manifest.name -or $lock.version -ne $manifest.version) { throw 'LOCKFILE_IDENTITY_MISMATCH' }
+          $root = $lock.packages['']
+          if ($null -eq $root) { throw 'LOCK_ROOT_MISSING' }
+          foreach ($kind in @('dependencies', 'devDependencies')) {
+            $declared = $manifest[$kind]
+            $actual = $root[$kind]
+            if ($actual.Count -ne $declared.Count) { throw 'LOCK_DECLARATION_MISMATCH' }
+            foreach ($key in $declared.Keys) {
+              if ($actual[$key] -ne $declared[$key]) { throw 'LOCK_DECLARATION_MISMATCH' }
+            }
+          }
+          foreach ($entry in $lock.packages.GetEnumerator()) {
+            if ($entry.Key -eq '') { continue }
+            if ($entry.Value.link -eq $true -or -not $entry.Value.integrity -or $entry.Value.resolved -notmatch '^https://registry[.]npmjs[.]org/') { throw 'UNREVIEWED_DEPENDENCY_SOURCE' }
+          }
+      - name: Set up pinned Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.15.0'
+      - name: Set up Python 3.12
+        id: python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install exactly the host lock without dependency lifecycle scripts
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm ci --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw 'LOCKED_INSTALL_FAILED' }
+      - name: Run the synthetic host suite
+        env:
+          PY312_EXE: ${{ steps.python.outputs.python-path }}
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: 'utf-8'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:PY312_EXE -c "import sys; assert sys.version_info[:2] == (3, 12)"
+          if ($LASTEXITCODE -ne 0) { throw 'PYTHON_VERSION_UNSUPPORTED' }
+          # Keep native SQLite/LanceDB paths below Windows limits; no production data is used.
+          $testTemp = Join-Path $env:RUNNER_TEMP ("dam-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+          if ($testTemp.Length -gt 70) { throw 'SYNTHETIC_TEMP_TOO_LONG' }
+          New-Item -ItemType Directory -Path $testTemp | Out-Null
+          $env:TEMP = $testTemp
+          $env:TMP = $testTemp
+          $env:TMPDIR = $testTemp
+          node --import tsx --test --test-reporter=tap --test-concurrency=1 "test/*.test.mjs"
+          if ($LASTEXITCODE -ne 0) { throw 'HOST_SYNTHETIC_TEST_FAILED' }
+  bti-synthetic:
+    needs: host-synthetic
+    if: ${{ !cancelled() }}
+    runs-on: windows-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: bti
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.12
+        id: python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Run the standard-library BTI suite
+        env:
+          PY312_EXE: ${{ steps.python.outputs.python-path }}
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: 'utf-8'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:PY312_EXE -c "import sys; assert sys.version_info[:2] == (3, 12)"
+          if ($LASTEXITCODE -ne 0) { throw 'PYTHON_VERSION_UNSUPPORTED' }
+          $testTemp = Join-Path $env:RUNNER_TEMP ("dam-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+          if ($testTemp.Length -gt 70) { throw 'SYNTHETIC_TEMP_TOO_LONG' }
+          New-Item -ItemType Directory -Path $testTemp | Out-Null
+          $env:TEMP = $testTemp
+          $env:TMP = $testTemp
+          $env:TMPDIR = $testTemp
+          $env:HOME = $testTemp
+          $env:USERPROFILE = $testTemp
+          $env:BTI_DATA_HOME = Join-Path $testTemp 'data'
+          $env:BTI_GRAPH_PENDING = ''
+          $env:PYTHONPATH = ''
+          # -S excludes site packages: no pip dependencies or optional LanceDB ingestion in this suite.
+          & $env:PY312_EXE -S -B -m unittest discover -p "test_*.py"
+          if ($LASTEXITCODE -ne 0) { throw 'BTI_SYNTHETIC_TEST_FAILED' }

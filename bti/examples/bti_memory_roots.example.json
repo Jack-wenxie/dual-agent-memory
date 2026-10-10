@@ -1,0 +1,12 @@
+{
+  "default_write_root": "primary",
+  "roots": [
+    {
+      "id": "primary",
+      "role": "primary",
+      "memory_dir": "bti-data/memories",
+      "memory_index": "bti-data/memories/MEMORY.md",
+      "notes": "Example root; point it at your own memory directory."
+    }
+  ]
+}
