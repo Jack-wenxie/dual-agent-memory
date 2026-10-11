@@ -14,7 +14,7 @@ How to check, back up and upgrade a running installation, and which signals shou
 | `retrievalProbe` | Result of this call's probe: `mode` (`active`, `passive` or `not_run`), `outcome`, and per-branch `ok`, `timeout`, `error`, `unavailable` or `circuit_open`. |
 | `writePlane` | `ready`, delivery semantics (`at-least-once`), `lastRecovery`, and per-queue `pending`, `inflight`, `acked` and `dead-letter` counts. |
 | `projectionConsumer` | `status` and `fresh` from the consumer's health file. |
-| `retrieval` | Deadlines, BM25 attempts, cache and circuit-breaker state, and timing. |
+| `retrieval` | Deadlines, BM25 attempts, cache and circuit-breaker state, and timing. `hostStallTimeouts` is cumulative for that coordinator and first appears after a host-stalled timeout. `host_stall_ms` belongs to the corresponding timing measurement and is omitted when that measurement has no sampled stall. |
 | `embedding` | Model, vector size and whether a query instruction is set. |
 | `security` | Loopback-only listener, memory-only tool surface, tool count, and whether the log key differs from the bearer secret. |
 
@@ -23,10 +23,16 @@ How to check, back up and upgrade a running installation, and which signals shou
 **Reading a `degraded` status.** Check in this order:
 
 1. `startup.phase` and `lastErrorCode`: the store may still be retrying.
-2. `retrievalProbe.branches`: a `timeout` or `circuit_open` on one branch points to the embedding service (vector) or the LanceDB full-text index (BM25).
+2. `retrievalProbe.branches`: inspect the embedding service (vector) or the LanceDB full-text index (BM25) after `timeout` or `circuit_open`. In v0.2 also inspect event-loop load and the optional host-stall counters/timing; a stalled deadline is not evidence that the backend alone caused the timeout.
 3. `writePlane.ready` and `writePlane.lastRecovery`: recovery failures need investigation before more writes.
 4. `writePlane.consumers`: dead letters, or `downstream_pending.pending` that does not drain.
 5. `projectionConsumer`: only meaningful when a consumer is deployed.
+
+A healthy retrieval probe does not prove that the current projection reference maps are ready. After a version change, verify one complete mapped recall. The fixed temporary-unavailability message means references are not ready, not that there are no matches; the audit adds `projectionRefs: "unavailable"` only for this state. Measure retrieval time and the additional reference wait separately. Nominal branch deadlines do not bound the complete request, especially when the host event loop is stalled.
+
+The cumulative counters are `retrieval.circuits.vector.hostStallTimeouts`, `retrieval.circuits.bm25.hostStallTimeouts` and `retrieval.primaryRead.hostStallTimeouts`. The measurement fields are `retrieval.timing.vector.host_stall_ms`, `retrieval.timing.bm25.host_stall_ms` and `retrieval.primaryRead.timing.host_stall_ms`. An absent counter can mean it has not appeared in this coordinator or the installation predates this feature; it is not a complete history of host load.
+
+The worker may hold old and new maps during a swap. Measure peak and steady memory in your own workload; this implementation makes no memory-reduction claim.
 
 If the store cannot initialise at all, for example because the embedding service is unreachable, the host retries up to three times and then exits with status 1. Start the embedding service first.
 
@@ -96,6 +102,6 @@ Keep thresholds in your own configuration and review them when the workload chan
 | The host refuses to start | The secret file is missing, unreadable or shorter than 16 characters. |
 | Memory tools answer "not ready" | The store is still initialising; see `startup`. |
 | The host exits shortly after starting | The store could not initialise, for example because the embedding service is unreachable or the LanceDB directory is not usable. |
-| Recall and list return nothing | No projection maps the records yet. This is expected on a fresh v0.1 installation. |
+| Recall and list return nothing | No projection maps the records yet. This is expected on a fresh v0.1 installation. In v0.2, a distinct temporary-unavailability message can instead mean the current maps are loading or unusable; retry a read after checking the projection. |
 | Tests fail with "unable to open database file" or "failed to persist temp file" | The temporary path is too long for the native libraries. Use a short `TEMP`. |
 | Companion saves stay pending | `PY312_EXE` is wrong, or the BTI exclusion file is missing; see [Architecture](ARCHITECTURE.md#companion-configuration). |

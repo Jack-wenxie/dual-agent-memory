@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-This is a v0.1 public candidate. Only the latest commit on the default branch receives fixes.
+This is an early public release. Only the latest commit on the default branch receives fixes.
 
 ## Reporting a vulnerability
 
@@ -22,6 +22,7 @@ The host is designed for one user on one machine. It is not a multi-user or netw
 - **Audit log without content.** Audit entries record the tool, a fixed input label and the outcome, not memory text or queries.
 - **Output safety.** Recall returns opaque references instead of internal IDs, withholds records that the current projection does not map, and replaces excerpts that look unsafe or reveal an identity with a redaction marker.
 - **Explicit data boundaries.** The query engine reads only explicitly configured source roots, and BTI writes require a fail-closed exclusion file. Nothing discovers personal data automatically.
+- **Offline reference code.** `graph-memory/` and `screen-context/` work only on paths and inputs that the caller supplies, contain no network code and start no service. The screen-context checks run the validator in a Node `vm` context, which is not a security sandbox; the privacy design of that layer is described in [docs/SCREEN_CONTEXT.md](docs/SCREEN_CONTEXT.md).
 
 ## Known limitations
 
@@ -34,4 +35,4 @@ The host is designed for one user on one machine. It is not a multi-user or netw
 
 ## Handling data
 
-Never commit `memory-data/`, LanceDB directories, secret files, write-ahead-log keys, BTI data, projection databases or exclusion lists. The repository's `.gitignore` excludes the default locations. If a secret is ever committed, treat it as exposed: replace it and rewrite the history before publishing.
+Never commit `memory-data/`, LanceDB directories, secret files, write-ahead-log keys, BTI data, projection databases, exclusion lists, memory-graph roots and releases, screen recordings or screen-context caches. The repository's `.gitignore` excludes the default locations. If a secret is ever committed, treat it as exposed: replace it and rewrite the history before publishing.

@@ -1,0 +1,57 @@
+{
+  "schema_version": "sentinel-thresholds/v0.2",
+  "_about": "Central threshold file read by the startup sentinel, the manual doctor, the debloat inventory and the maintenance runner's check to decide whether maintenance is due; the reminder reliability ledger reads only the review_conversation section. Every number in this file is the default the reference installation uses today; the key names are generic renames of the real keys. The loader reads only the keys it knows. Every other key, including the underscore-prefixed documentation keys and any misspelled key, is ignored; a misspelled key shows up only as a missing key filled from defaults (threshold_source file+defaults). An unreadable file falls back to the defaults and records the error. Skills and reminder contracts never copy these numbers; the code that needs them reads this file.",
+  "debloat": {
+    "_notes": "Size and accumulation signals for a debloat review (see SYSTEM_HEALTH_AND_GOVERNANCE.md, section 11). Every startup reminder from this section waits until maintenance_min_interval_days have passed since a verified maintenance receipt; growth or urgency cannot bypass that cooldown. The manual doctor still lists due items during the cooldown. The two instruction-file limits use different units because the two agents' files are measured differently. The startup sentinel also compares backup_count with the doctor's count of backup-named files, a different measure from the inventory's count of files inside the two backup folders.",
+    "claude_instruction_file_chars": 45000,
+    "codex_instruction_file_bytes": 55000,
+    "codex_instruction_file_urgent_bytes": 60000,
+    "codex_instruction_file_growth_step_bytes": 5000,
+    "maintenance_min_interval_days": 5,
+    "legacy_memory_index_lines": 132,
+    "event_feed_non_ok_ratio": 0.6,
+    "event_feed_recent_window_rows": 120,
+    "event_feed_recent_min_rows": 20,
+    "event_feed_failure_streak": 5,
+    "agent_temp_dir_mb": 400,
+    "backup_count": 40,
+    "backup_mb": 80,
+    "doctor_report_dirs": 30,
+    "retired_archive_age_days": 30
+  },
+  "skill_crystallization": {
+    "_notes": "Backlog of human-gated candidates mined from repeated runbooks. Due when failures reach runbook_failure; or when total reaches runbook_total and the oldest pending candidate is at least runbook_pending_age_days old; or when the miner's queue is older than runbook_rerun_age_days while the event stream keeps growing (rerun the miner).",
+    "runbook_failure": 5,
+    "runbook_total": 20,
+    "runbook_pending_age_days": 14,
+    "runbook_rerun_age_days": 21
+  },
+  "skill_discovery": {
+    "_notes": "Pattern review is due review_interval_days after the last completed review, and only if at least one semantic memory note changed since that review's watermark; or when screen_digest_days new validated daily digests exist. An open, unreviewed batch is due immediately.",
+    "review_interval_days": 7,
+    "screen_digest_days": 7
+  },
+  "skill_queue": {
+    "_notes": "Shared skill-opportunity queue. One approved-for-validation candidate is enough to remind (highest priority); otherwise remind when proposed plus needs-human-review candidates reach the second value.",
+    "approved_for_validation": 1,
+    "needs_human_review": 5
+  },
+  "memory_graph": {
+    "_notes": "Memory-graph refresh is due when unconsumed pending entries reach pending_count, or when more memory cards differ from the active release than unconsumed entries can explain; that comparison is a count and cannot prove that every change was queued, and it lives in the probe code, not in this file. Graph age is reported but does not trigger a reminder. Below the threshold does not mean every new memory is in the graph.",
+    "graph_age_days": 7,
+    "pending_count": 300,
+    "age_triggers_reminder": false
+  },
+  "review_conversation": {
+    "_notes": "Optional owner review conversation prepared from local evidence. After a visible reminder, wait reminder_interval_days before reminding again; remind at most once per prepared batch; flag the material for a relevance recheck when it is older than material_recheck_after_days.",
+    "reminder_interval_days": 30,
+    "once_per_batch": true,
+    "material_recheck_after_days": 7
+  },
+  "knowledge_vault_graph": {
+    "_notes": "Research knowledge vault graph. Due when the pending count reaches pending_count: the full health check in generation mode uses the effective count (non-comment entries minus those the active generation adopted at their current source version); the session-start probe, and every check in single-snapshot mode, use the raw non-comment count. Age is informational. Unlike the memory graph, it has no count comparison of changed sources against the queue.",
+    "graph_age_days": 7,
+    "pending_count": 100,
+    "age_triggers_reminder": false
+  }
+}

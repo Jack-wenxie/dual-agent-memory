@@ -6,11 +6,13 @@ Thank you for helping. Questions, bug reports and suggestions are welcome as iss
 
 Follow [Run the tests](README.md#run-the-tests) in the README. The tested platform is Windows x64 with Node 24.15.0 and Python 3.12. Keep `TEMP` short, because the native SQLite and LanceDB libraries fail on long paths.
 
-All three suites must pass before a pull request is merged:
+All five checks must pass before a pull request is merged:
 
 - `npm test` in `lancedb-memory-host/`;
 - `npm test` in `mqe/`;
-- `python -m unittest discover -p "test_*.py"` in `bti/`.
+- `python -m unittest discover -p "test_*.py"` in `bti/`;
+- the synthetic demo in `graph-memory/`, run as described in [graph-memory/README.md](graph-memory/README.md);
+- the offline checks in `screen-context/`, run as described in [screen-context/README.md](screen-context/README.md).
 
 ## Rules for changes
 

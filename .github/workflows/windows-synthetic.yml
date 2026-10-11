@@ -172,3 +172,81 @@ jobs:
           # -S excludes site packages: no pip dependencies or optional LanceDB ingestion in this suite.
           & $env:PY312_EXE -S -B -m unittest discover -p "test_*.py"
           if ($LASTEXITCODE -ne 0) { throw 'BTI_SYNTHETIC_TEST_FAILED' }
+  graph-release-synthetic:
+    runs-on: windows-latest
+    needs: bti-synthetic
+    if: ${{ !cancelled() }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.12
+        id: python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Run sealed release and pending reference checks
+        shell: pwsh
+        env:
+          PY312_EXE: ${{ steps.python.outputs.python-path }}
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Short, isolated temporary paths avoid native Windows path limits.
+          $methodTemp = Join-Path $env:RUNNER_TEMP ("method-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+          if ($methodTemp.Length -gt 70) { throw 'SYNTHETIC_TEMP_TOO_LONG' }
+          New-Item -ItemType Directory -Path $methodTemp | Out-Null
+          $env:TEMP = $methodTemp
+          $env:TMP = $methodTemp
+          $env:TMPDIR = $methodTemp
+          $env:GRAPH_MEMORY_MODULE_DIR = Join-Path $env:GITHUB_WORKSPACE 'graph-memory/core'
+          $env:GRAPH_MEMORY_DEMO_NOTEBOOK = Join-Path $env:GITHUB_WORKSPACE 'graph-memory/synthetic_demo.ipynb'
+          & $env:PY312_EXE -I -S -B -X utf8 -c "import json,os,sys; from pathlib import Path; assert sys.version_info[:2]==(3,12); p=Path(os.environ['GRAPH_MEMORY_DEMO_NOTEBOOK']); n=json.loads(p.read_bytes()); g={'__name__':'__main__'}; [exec(compile(''.join(c['source']),'<synthetic-demo>','exec'),g) for c in n['cells'] if c['cell_type']=='code']"
+          if ($LASTEXITCODE -ne 0) { throw 'GRAPH_REFERENCE_CHECK_FAILED' }
+  screen-context-synthetic:
+    # Serialize setup calls while provider quotas are unspecified.
+    needs: graph-release-synthetic
+    if: ${{ !cancelled() }}
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Set up pinned Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.15.0'
+      - name: Set up Python 3.12
+        id: python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Verify fixed-seed cache and purpose checks
+        shell: pwsh
+        env:
+          PY312_EXE: ${{ steps.python.outputs.python-path }}
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $methodTemp = Join-Path $env:RUNNER_TEMP ("context-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+          if ($methodTemp.Length -gt 70) { throw 'SYNTHETIC_TEMP_TOO_LONG' }
+          New-Item -ItemType Directory -Path $methodTemp | Out-Null
+          $env:TEMP = $methodTemp
+          $env:TMP = $methodTemp
+          $env:TMPDIR = $methodTemp
+          $env:SCREEN_CONTEXT_ROOT = $env:GITHUB_WORKSPACE
+          $env:SCREEN_CONTEXT_FIXTURE_ACTION = 'verify'
+          $env:NODE_BINARY = (Get-Command node.exe -ErrorAction Stop).Source
+          $env:SCREEN_CONTEXT_DEMO_NOTEBOOK = Join-Path $env:GITHUB_WORKSPACE 'screen-context/offline-checks.ipynb'
+          & $env:PY312_EXE -I -S -B -X utf8 -c "import json,os,sys; from pathlib import Path; assert sys.version_info[:2]==(3,12); p=Path(os.environ['SCREEN_CONTEXT_DEMO_NOTEBOOK']); n=json.loads(p.read_bytes()); g={'__name__':'__main__'}; [exec(compile(''.join(c['source']),'<offline-checks>','exec'),g) for c in n['cells'] if c['cell_type']=='code']"
+          if ($LASTEXITCODE -ne 0) { throw 'CONTEXT_REFERENCE_CHECK_FAILED' }

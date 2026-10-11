@@ -2,6 +2,17 @@
 
 This document describes how the three packages fit together in v0.1. It covers what the code does, not deployment guarantees: the producer, the online consumer and application hooks are included as source only and are not enabled. See [Design decisions](DECISIONS.md) for the reasons behind the main choices.
 
+## Where these packages sit in the whole system
+
+The three packages cover three layers of a larger knowledge and memory system for two coding agents, described layer by layer in [System overview](SYSTEM_OVERVIEW.md). The package layout is retained in v0.2. The host loading and timeout changes described below apply to v0.2; the remaining v0.1 statements keep their original scope. v0.2 adds reference code with synthetic checks for the memory graph and screen context, two optional layers that the packages do not need, and covers the other layers with method documents and templates. The method documents are indexed in [README.md](README.md) in this folder. No layer ships real data; all fixtures are synthetic.
+
+| Layer | What this repository ships |
+|---|---|
+| Memory host, query engine and memory cards | Code and tests in `lancedb-memory-host/`, `mqe/` and `bti/`, exercised with synthetic data except for the source-only parts named above, and described in this document. How agents use them: [Memory governance](MEMORY_GOVERNANCE.md). |
+| Memory graph (optional) | Reference code with synthetic checks: a release and briefing kernel in [`graph-memory/`](../graph-memory/README.md). Source sync, model extraction, graph building and the health check are method only, and no graph data is included. Method: [Memory graph](MEMORY_GRAPH.md). |
+| Screen context (optional) | Reference code with synthetic checks: an offline validator for completed screen-context caches in [`screen-context/`](../screen-context/README.md). It is not a Screenpipe client, and no captures are included. Method: [Screen context](SCREEN_CONTEXT.md). |
+| [Instruction kernel](INSTRUCTION_KERNEL.md), [Project authority notes](PROJECT_AUTHORITY_NOTES.md), [Research knowledge vault](RESEARCH_KNOWLEDGE_VAULT.md), [Routing and gates](ROUTING_AND_GATES.md), [Agent collaboration](AGENT_COLLABORATION.md), [System health and governance](SYSTEM_HEALTH_AND_GOVERNANCE.md), [Five-dimension programme](FIVE_DIMENSION_PROGRAMME.md) | Method documents and templates only. |
+
 ## Components
 
 ```mermaid
@@ -63,7 +74,7 @@ The companion runs `bti/memory_save_tx.py` with `PY312_EXE`. It writes cards und
 
 1. **Search.** Vector search (through the embedding service) and BM25 search run against LanceDB, each with its own deadline, and their results are fused by reciprocal rank. Repeated failures open a branch's circuit breaker for a cool-down period. If semantic search fails, a bounded local lexical index answers instead, and the response says so.
 2. **Lifecycle.** The current projection's gates keep only current records. When the query asks about history, superseded or inactive records may also be kept, labelled as no longer current; records that the hard gates reject are never kept.
-3. **References.** Each remaining hit is mapped to its `rr1_…` reference through the current projection. Hits without a mapping are withheld; raw internal IDs are never returned.
+3. **References.** Each remaining hit is mapped to its `rr1_…` reference through the current projection. Hits without a mapping are withheld; raw internal IDs are never returned. In v0.2, the resolver validates and loads a new projection in a worker, checks the selected generation again before installing the maps, and prefetches when CURRENT changes. The request has a nominal five-second reference-readiness wait after retrieval; this is separate from branch deadlines. If candidates exist but current references are not ready, recall and list return a fixed temporary-unavailability message rather than claim that nothing matched.
 4. **Output safety.** Text is sanitised, and an excerpt that is unsafe or reveals an identity is replaced by a redaction marker. If memory or the projection changes while the call runs, the call returns no results and asks the caller to retry.
 
 The response is plain text with a short retrieval line: `mode`, cache status and the state of each branch. `memory_list` applies the same reference mapping, so it also lists only mapped records.
@@ -73,6 +84,14 @@ The response is plain text with a short retrieval line: `mode`, cache status and
 A projection is a read-only SQLite database, `mqe/data/projection/memory_index.<epoch>.sqlite`, selected by the pointer `mqe/data/projection/CURRENT.json`. The pointer records the schema, reference-key identifier, corpus epoch, file name and checksum. The host and the engine load one generation and check its identity before use. References are keyed HMACs of the record ID: stable for one key, and they do not expose the ID directly. They are not anonymisation and do not replace access control.
 
 In v0.1 nothing builds or activates a projection automatically. A fresh installation has no `CURRENT.json`, so recall and list return no records. The seeded test [`seeded-projection-recall.test.mjs`](../lancedb-memory-host/test/seeded-projection-recall.test.mjs) builds a synthetic projection with the query engine's generator and runs the full mapped path through the real host.
+
+### Projection-loading and timeout boundaries in v0.2
+
+The [worker](../lancedb-memory-host/src/projection-ref-worker.mjs) uses the same [projection contract](../mqe/projection/projection_contract.mjs). Moving checksum and integrity work off the request thread does not relax its file, epoch or lifecycle gates. Obsolete loads are not installed; an unreadable or changed projection cannot mint references. The online producer, consumer and hook remain source-only.
+
+Save and update retain the write-plane contract. A reference-dependent guard that cannot validate the current projection fails closed; a prepared save can resume with the same idempotency key after references become ready. A committed save with a pending reference is not repeated as a new transaction.
+
+A late deadline timer gets one event-loop poll opportunity to let already-ready work complete. If it still times out and the host was stalled, timeout attribution is inconclusive: the first such failure is not charged immediately to the backend circuit, but every second consecutive inconclusive timeout counts. Existing failures are not erased and ordinary backend timeouts still count. This does not prove that a simultaneously slow backend was healthy. It is not a lower latency or memory-use guarantee; a stalled event loop can also deliver the reference-wait timer late.
 
 ## Health
 

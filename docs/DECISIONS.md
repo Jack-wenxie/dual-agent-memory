@@ -77,3 +77,35 @@ Reviewed safe summaries, supersession of one memory by another, bounded BM25 dia
 ### Vendor one upstream file with a recorded patch
 
 The host uses the storage layer of an upstream package. Instead of depending on the published package, this repository ships the [single file](../third_party/memory-lancedb-pro-1.0.32/README.md) it needs, unmodified, together with our patch and a verifier that rebuilds our copy byte for byte. Changes stay reviewable and the origin stays checkable, at the cost of applying upstream fixes by hand.
+
+## Whole-system method
+
+These decisions describe what release v0.2 publishes about the system around the three packages: its layers, rules and methods. They describe one reference installation; they do not claim that any layer has been validated outside it. The [system overview](SYSTEM_OVERVIEW.md) maps the layers to the documents.
+
+### Publish the method, never the data
+
+The repository explains how each layer is structured, triggered, checked and governed, and ships templates and synthetic examples. It never ships the notes, memories, graphs, screen captures or logs that the reference installation holds. The method is what another person can reuse; the data is personal and would also teach a reader nothing that a synthetic example cannot. The cost is that no document can be checked against the real data by a reader; claims about behaviour are therefore limited to what the published code and its synthetic checks exercise.
+
+### State defaults as configurable values
+
+Thresholds, retention periods and limits appear as the defaults of the reference installation, with the reason where one is known, not as recommendations. They were chosen for one owner on one machine. Stating them lets a reader see the shape of the method; calling them defaults keeps a reader from treating them as tested optima.
+
+### Ship code only where a small closure runs on synthetic data
+
+Code is published for a layer only when a small, self-contained part of it runs on synthetic input in CI and drives its own failure branches: the three packages from v0.1, the sealed-release, resolver and briefing kernel of the [memory graph](MEMORY_GRAPH.md), and the offline cache validator of the [screen context](SCREEN_CONTEXT.md) layer. The other layers are published as method and templates. New code that depends on the owner's services, accounts, schedules or user interface stays private, because it could not be run or reviewed by anyone else in a meaningful way; the source-only integration material that v0.1 already published stays disabled, as described in [Keep online integration outside the demonstration boundary](#keep-online-integration-outside-the-demonstration-boundary).
+
+### Document the screen layer without bundling the recorder
+
+The screen-context layer uses Screenpipe, which is distributed under its vendor's own commercial license. This repository describes the method around the recorder and ships only our own offline validator for completed screen-context caches and its synthetic checks; it includes no Screenpipe binaries, source or license text and makes no statement about which uses the vendor's license permits. Readers who want the layer must obtain and license the recorder themselves.
+
+### Restate instructions rather than copy them
+
+The agent instruction files and skills of the reference installation are not published. The documents restate their rules in neutral words, with the reason for each rule and the failure that led to it where that helps. This keeps private context out of the repository and makes the method readable without the original files; it also means the published wording is a description, not the text the agents actually load.
+
+## Projection loading off the request thread
+
+The memory host validates each selected SQLite generation in a worker, then checks the selection and loaded maps again before installing them. Loading is shared for one selection and superseded work is cancelled. Requests keep the lifecycle and reference gates; they never use an old map to fabricate a reference or interpret an unavailable map as a missing record.
+
+The request's nominal five-second reference-readiness wait follows retrieval. It is separate from branch deadlines and can complete late on a stalled event loop. Reference-dependent writes retain their prepared/idempotent retry contract. Temporary unavailable references remain distinct from no-match and backend failure.
+
+Deadline attribution gives already-ready work one event-loop poll opportunity. A remaining host-stalled timeout is inconclusive for the backend; consecutive inconclusive failures still reach the circuit. This is a functional separation, not proof of backend health or lower memory consumption. The synthetic [stall tests](../lancedb-memory-host/test/memory-runtime-host-stall.test.mjs) and [projection tests](../lancedb-memory-host/test/projection-ref-resolver.test.mjs) define the exercised branches. Live-service latency, peak memory and deployment effectiveness require separate measurements.

@@ -1,0 +1,17 @@
+{
+  "schema": "screen-context-policy/v1",
+  "runtime_mode": "offline-only",
+  "purpose_grants": {
+    "on-demand-recall": false,
+    "proactive-suggestion": false,
+    "recent-context": false
+  },
+  "maximum_cache_age_ms": 86400000,
+  "maximum_cache_bytes": 16384,
+  "captured_content_untrusted": true,
+  "network_access": false,
+  "model_calls": false,
+  "periodic_model_refresh": false,
+  "automatic_memory_promotion": false,
+  "automatic_project_state_write": false
+}

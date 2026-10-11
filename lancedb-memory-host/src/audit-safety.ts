@@ -31,6 +31,7 @@ const SAFE_ENUMS: Record<string, Set<string>> = {
   bm25Status: new Set(["ok", "timeout", "error", "unavailable", "circuit_open"]),
   bm25Recovery: new Set(["none", "chunked-query"]),
   currentness: new Set(["inactive", "applied"]),
+  projectionRefs: new Set(["unavailable"]),
   status: new Set(["stored", "duplicate", "updated", "not_found"]),
   method: new Set(["GET", "POST", "DELETE", "OPTIONS"]),
   ip: new Set(["loopback"]),

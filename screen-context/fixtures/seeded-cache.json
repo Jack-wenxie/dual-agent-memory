@@ -1,0 +1,40 @@
+{
+  "schema": "synthetic-screen-context-fixture/v1",
+  "synthetic": true,
+  "seed": 732451,
+  "generator": "LCG32:1664525*x+1013904223 mod 2^32; Python SHA-256 event IDs",
+  "clock_utc": "2020-01-02T12:00:00.000Z",
+  "cache": {
+    "schema": "screen-context-cache/v1",
+    "revision": "07a7700b9781e2b0ae4aae421d016e5ce040efa5bb029c24148284da5326f340",
+    "generated_at_utc": "2020-01-02T12:00:00.000Z",
+    "source_from_utc": "2020-01-02T10:00:00.000Z",
+    "source_until_utc": "2020-01-02T11:57:00.000Z",
+    "coverage": "partial",
+    "pending_count": 2,
+    "items": [
+      {
+        "event_ids": [
+          "e_eeaa9235279dd361d8cfdbca"
+        ],
+        "category": "work",
+        "text": "A fictional invitation is displayed; acceptance is unconfirmed."
+      },
+      {
+        "event_ids": [
+          "e_d674a4c783b1bdc49948a30d"
+        ],
+        "category": "life",
+        "text": "A fabricated note is open; it establishes no preference."
+      },
+      {
+        "event_ids": [
+          "e_c33ff806b6156c7dd0394797"
+        ],
+        "category": "learning",
+        "text": "A synthetic draft is visible; delivery and acceptance are unknown."
+      }
+    ],
+    "captured_content_untrusted": true
+  }
+}

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
@@ -210,4 +210,71 @@ test("both recall return paths share the session-gated diagnostics", () => {
   assert.match(handler, /const recallDiagnostics = sessionLeaseOwner\s*\?\s*\{ structuredContent: publicRecallDiagnostics\(outcome\) \}\s*:\s*\{\};/u);
   assert.equal((handler.match(/\.\.\.recallDiagnostics,/gu) ?? []).length, 2);
   assert.doesNotMatch(handler, /^\s*structuredContent,\s*$/mu);
+});
+
+// Matches whose refs cannot be minted while no current projection is loaded must read as a
+// retryable unavailability, never as "no match". It needs a checkout without a live projection.
+test("recall and list with matches answer retry, not no-match, while refs are unavailable", { timeout: 120_000 }, async (t) => {
+  if (existsSync(new URL("../../mqe/data/projection/CURRENT.json", import.meta.url))) {
+    t.skip("a live projection is present, so refs can be minted in this checkout");
+    return;
+  }
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "lancedb-recall-refs-"));
+  const secret = crypto.randomBytes(24).toString("hex");
+  const secretFile = path.join(temp, "secret.txt");
+  await fs.writeFile(secretFile, secret, "utf8");
+  await fs.mkdir(path.join(temp, "workspace"));
+  await fs.mkdir(path.join(temp, "memory-data"));
+  const embedding = await startFakeEmbeddingServer();
+  const port = await freePort();
+  // Every store, WAL, queue, audit and barrier path points into the temp tree.
+  const child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
+    cwd: new URL("..", import.meta.url),
+    // Public build: a minimal environment, so nothing from the caller's shell (NODE_OPTIONS, data paths) leaks in.
+    env: {
+      PATH: process.env.PATH ?? "",
+      ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+      TEMP: temp, TMP: temp, TMPDIR: temp, HOME: temp, USERPROFILE: temp,
+      PORT: String(port),
+      SECRET_FILE: secretFile,
+      LANCEDB_MEMORY_DB: path.join(temp, "memory-db"),
+      MEMORY_DATA: path.join(temp, "memory-data"),
+      MEMORY_WRITE_PLANE_ROOT: path.join(temp, "memory-data", "write-plane"),
+      MEMORY_WAL_KEY_FILE: path.join(temp, "memory-data", "write-plane", ".wal-key"),
+      MQE_CONSUMER_HEALTH_FILE: path.join(temp, "consumer-health.json"),
+      OLLAMA_URL: embedding.url,
+      RATE_LIMIT: "1000",
+      PYTHONUTF8: "1",
+      PYTHONIOENCODING: "utf-8",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stderr.on("data", (chunk) => { output += chunk; });
+  t.after(async () => {
+    await stopChild(child);
+    await new Promise((resolve) => embedding.server.close(resolve));
+    await removeWithRetry(temp);
+  });
+
+  const endpoint = `http://127.0.0.1:${port}/mcp/${secret}`;
+  await waitUntilReady(endpoint, child, () => output);
+  const client = await connect(endpoint);
+  try {
+    const text = "projection availability probe memory";
+    const saved = await client.callTool({ name: "memory_save_tx", arguments: { idempotency_key: "projection-refs-probe-0001", text } });
+    const receipt = JSON.parse(saved.content?.[0]?.text ?? "null");
+    assert.equal(receipt?.status, "stored");
+    assert.equal(receipt?.record_ref_status, "pending_projection");
+    const recall = await client.callTool({ name: "memory_recall", arguments: { query: text, limit: 3 } });
+    assert.match(recall.content?.[0]?.text ?? "", /^Memory references are temporarily unavailable; please retry\. \[mode=/u);
+    const list = await client.callTool({ name: "memory_list", arguments: {} });
+    assert.equal(list.content?.[0]?.text, "Memory references are temporarily unavailable; please retry.");
+  } finally {
+    await client.close();
+  }
 });

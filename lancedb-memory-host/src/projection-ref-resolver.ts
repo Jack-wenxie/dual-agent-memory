@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { SupersessionConflict, type SupersessionProjectionTarget, type SupersessionSnapshot } from "./supersession-contract.js";
 import { readFileSync, statSync } from "node:fs";
 import path from "node:path";
+import { Worker } from "node:worker_threads";
 
 // @ts-expect-error The shared runtime module is JavaScript without declarations.
 import { loadProjectionRefMap } from "../../mqe/projection/projection_contract.mjs";
@@ -92,6 +93,11 @@ export interface ProjectionRefResolverOptions {
     currentSnapshotReader: (pointerPath: string) => CurrentSnapshot;
     fileIdentityReader: (filePath: string) => unknown;
   }) => ProjectionLoadResult;
+  // Off-thread mode (takes precedence over loadProjection): a synchronous lookup never loads on
+  // a cache miss. It withholds, exactly as for an unreadable projection, and starts this loader;
+  // ensureCurrent() awaits it. The host passes loadProjectionInWorker. signal aborts a load that
+  // a newer CURRENT has overtaken.
+  backgroundLoadProjection?: (options: { dataDir: string; signal?: AbortSignal }) => Promise<ProjectionLoadResult>;
 }
 
 function validPointer(value: unknown): value is ProjectionPointer {
@@ -203,12 +209,67 @@ function genericCompanionSummary(value: unknown): boolean {
       .test(value.normalize("NFKC").trim());
 }
 
+const PROJECTION_WORKER_URL = new URL("./projection-ref-worker.mjs", import.meta.url);
+// A worker that has not answered by then is terminated, so the single load slot cannot wedge.
+const PROJECTION_WORKER_TIMEOUT_MS = 120_000;
+// The same selection is not reloaded off-thread sooner than this after a failed load, and only
+// on demand: the idle prefetch never retries a failed selection.
+const BACKGROUND_RETRY_MS = 5_000;
+
+// Runs the shared loadProjectionRefMap (logical checksum, integrity_check, map build) with its
+// default readers in a short-lived worker thread, so none of it blocks the host event loop.
+// The result is untrusted until the resolver re-checks it against its own CURRENT selection.
+export function loadProjectionInWorker(
+  { dataDir, signal }: { dataDir: string; signal?: AbortSignal },
+): Promise<ProjectionLoadResult> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("projection_worker_aborted"));
+      return;
+    }
+    const worker = new Worker(PROJECTION_WORKER_URL, { workerData: { dataDir }, execArgv: [] });
+    const stop = (code: string) => {
+      reject(new Error(code));
+      void worker.terminate();
+    };
+    const watchdog = setTimeout(() => stop("projection_worker_timeout"), PROJECTION_WORKER_TIMEOUT_MS);
+    watchdog.unref();
+    // Terminating releases the worker's read handle on the projection file.
+    const onAbort = () => stop("projection_worker_aborted");
+    signal?.addEventListener("abort", onAbort, { once: true });
+    worker.once("message", (message: { loaded?: ProjectionLoadResult | null } | null) => {
+      clearTimeout(watchdog);
+      const loaded = message?.loaded;
+      if (!loaded || !(loaded.activeRowsById instanceof Map)) {
+        reject(new Error("projection_worker_load_failed"));
+        return;
+      }
+      // Structured clone drops the loader's row freeze; restore it before any row is read.
+      for (const row of loaded.activeRowsById.values()) Object.freeze(row);
+      resolve(loaded);
+    });
+    worker.once("error", () => {
+      clearTimeout(watchdog);
+      reject(new Error("projection_worker_failed"));
+    });
+    worker.once("exit", () => {
+      clearTimeout(watchdog);
+      signal?.removeEventListener("abort", onAbort);
+      reject(new Error("projection_worker_exited"));
+    });
+  });
+}
+
 export class ProjectionRefResolver {
   private readonly dataDir: string;
   private readonly currentSnapshotReader: (pointerPath: string) => CurrentSnapshot;
   private readonly fileIdentityReader: (filePath: string) => unknown;
   private readonly loadProjection: ProjectionRefResolverOptions["loadProjection"];
+  private readonly backgroundLoadProjection: ProjectionRefResolverOptions["backgroundLoadProjection"];
   private cache: CachedProjection | null = null;
+  private backgroundLoad: { selection: StableSelection; settled: Promise<void>; abort: AbortController } | null = null;
+  private backgroundFailure: { selection: StableSelection; retryAt: number } | null = null;
+  private prefetchTimer: ReturnType<typeof setInterval> | null = null;
   private readonly summarySnapshots = new WeakMap<object, StableSelection>();
   readonly #supersessionProofs = new WeakMap<object, { selection: StableSelection; ref: string }>();
 
@@ -217,6 +278,7 @@ export class ProjectionRefResolver {
     this.currentSnapshotReader = options.currentSnapshotReader ?? defaultCurrentSnapshot;
     this.fileIdentityReader = options.fileIdentityReader ?? defaultFileIdentity;
     this.loadProjection = options.loadProjection ?? loadProjectionRefMap;
+    this.backgroundLoadProjection = options.backgroundLoadProjection;
   }
 
   // Host-internal proof: not a caller-supplied boolean or a serialized CURRENT assertion.
@@ -386,6 +448,80 @@ export class ProjectionRefResolver {
     }
   }
 
+  // Write-plane lookup: null only when the loaded current projection has no such ref. An unloaded
+  // or unreadable projection throws instead, so a failure never becomes a durable NOOP_NOT_FOUND.
+  async recordIdForMutationRef(recordRef: unknown, budgetMs: number): Promise<string | null> {
+    if (typeof recordRef !== "string" || !RECORD_REF.test(recordRef)) return null;
+    await this.ensureCurrent(budgetMs);
+    const value = this.loadedProjection().recordIdByRef.get(recordRef);
+    return safeRawId(value) ? value : null;
+  }
+
+  // True only while the cache holds the projection that CURRENT selects now. Never loads.
+  hasCurrentProjection(): boolean {
+    try {
+      return Boolean(this.cache && sameSelection(this.cache, this.inspectSelection()));
+    } catch {
+      return false;
+    }
+  }
+
+  // Bounded wait until the projection CURRENT selects is loaded off the calling thread, so the
+  // synchronous lookups that follow hit the cache. False means those lookups will withhold.
+  async ensureCurrent(budgetMs: number): Promise<boolean> {
+    if (!this.backgroundLoadProjection) {
+      try {
+        this.loadedProjection();
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    const deadline = performance.now() + (Number.isFinite(budgetMs) ? Math.max(0, budgetMs) : 0);
+    for (;;) {
+      let selection: StableSelection;
+      try {
+        selection = this.inspectSelection();
+      } catch {
+        return false;
+      }
+      if (this.cache && sameSelection(this.cache, selection)) return true;
+      const settled = this.requestBackgroundLoad(selection);
+      const remainingMs = deadline - performance.now();
+      if (!settled || remainingMs <= 0) return false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finished = await Promise.race([
+        settled.then(() => true),
+        new Promise<boolean>((resolve) => { timer = setTimeout(resolve, remainingMs, false); }),
+      ]);
+      clearTimeout(timer);
+      // A finished load may have been overtaken by a newer CURRENT; the loop re-inspects.
+      if (!finished) return false;
+    }
+  }
+
+  // Watches CURRENT cheaply (one small read and three stats per tick) and starts the off-thread
+  // load as soon as the selection changes, so requests usually find the cache already warm.
+  // A selection whose load failed is left to on-demand retries, so a bad CURRENT costs no idle work.
+  startPrefetch(intervalMs: number): void {
+    if (!this.backgroundLoadProjection || this.prefetchTimer) return;
+    const tick = () => {
+      try {
+        const selection = this.inspectSelection();
+        if (this.backgroundFailure && sameSelection(this.backgroundFailure.selection, selection)) return;
+        void this.requestBackgroundLoad(selection);
+      } catch {}
+    };
+    this.prefetchTimer = setInterval(tick, Math.max(50, Number.isFinite(intervalMs) ? intervalMs : 0));
+    this.prefetchTimer.unref();
+    tick();
+  }
+
+  stopPrefetch(): void {
+    if (this.prefetchTimer) clearInterval(this.prefetchTimer);
+    this.prefetchTimer = null;
+  }
+
   private inspectSelection(): StableSelection {
     const pointerPath = path.join(this.dataDir, "CURRENT.json");
     const snapshot = this.currentSnapshotReader(pointerPath);
@@ -409,9 +545,50 @@ export class ProjectionRefResolver {
     };
   }
 
+  // One off-thread load at a time. Its result is installed only when CURRENT still selects
+  // exactly what it selected before the load, the same check loadedProjection() makes in-thread.
+  private requestBackgroundLoad(selection: StableSelection): Promise<void> | null {
+    if (this.cache && sameSelection(this.cache, selection)) return Promise.resolve();
+    if (this.backgroundLoad) {
+      if (sameSelection(this.backgroundLoad.selection, selection)) return this.backgroundLoad.settled;
+      // CURRENT has moved on, so the running load could only be discarded: stop it, load the newest.
+      this.backgroundLoad.abort.abort();
+      this.backgroundLoad = null;
+    }
+    if (this.backgroundFailure && sameSelection(this.backgroundFailure.selection, selection)
+        && performance.now() < this.backgroundFailure.retryAt) return null;
+    const abort = new AbortController();
+    const settled: Promise<void> = Promise.resolve()
+      .then(() => this.backgroundLoadProjection!({ dataDir: this.dataDir, signal: abort.signal }))
+      .then((loaded) => {
+        const after = this.inspectSelection();
+        if (abort.signal.aborted || !sameSelection(selection, after) || !validLoadedProjection(loaded, after)) {
+          throw new Error("projection_binding_invalid");
+        }
+        this.cache = { ...after, loaded };
+        this.backgroundFailure = null;
+      })
+      .catch(() => {
+        // An aborted load says nothing about its selection; only real failures back off.
+        if (!abort.signal.aborted) {
+          this.backgroundFailure = { selection, retryAt: performance.now() + BACKGROUND_RETRY_MS };
+        }
+      })
+      .finally(() => {
+        if (this.backgroundLoad?.settled === settled) this.backgroundLoad = null;
+      });
+    this.backgroundLoad = { selection, settled, abort };
+    return settled;
+  }
+
   private loadedProjection(): ProjectionLoadResult {
     const before = this.inspectSelection();
     if (this.cache && sameSelection(this.cache, before)) return this.cache.loaded;
+    // Off-thread mode never loads here: an unloaded projection mints no ref, like an unreadable one.
+    if (this.backgroundLoadProjection) {
+      void this.requestBackgroundLoad(before);
+      throw new Error("projection_loading");
+    }
     if (!this.loadProjection) throw new Error("projection_loader_unavailable");
     const loaded = this.loadProjection({
       dataDir: this.dataDir,

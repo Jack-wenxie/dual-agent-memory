@@ -177,6 +177,7 @@ export interface PreparedSaveCommit {
   metadata: string;
   supersessionSnapshot?: SupersessionSnapshot;
   supersessionGuard?: () => boolean;
+  supersessionGuardReady?: () => Promise<unknown>;
 }
 
 export interface PreparedUpdateCommit {
@@ -266,6 +267,8 @@ export interface MemoryWritePlaneOptions {
   maxConsumerAttempts?: number;
   supersessionEnabled?: boolean;
   validateSupersessionSnapshot?: (recordRef: string, snapshot: SupersessionSnapshot) => boolean;
+  // Awaited right before that synchronous validation, so what it reads can be made ready first.
+  prepareSupersessionValidation?: () => Promise<unknown>;
   resolveSupersessionRef?: (recordRef: string) => SupersessionProjectionTarget | null | Promise<SupersessionProjectionTarget | null>;
   faultInjector?: (point: WritePlaneFaultPoint) => void | Promise<void>;
   producerAdmission?: (operation: "mutation" | "recovery", capability?: object) => void;
@@ -801,6 +804,7 @@ export class MemoryWritePlane {
   private readonly adapter: WritePlaneAdapter;
   private readonly supersessionEnabled: boolean;
   private readonly validateSupersessionSnapshot?: MemoryWritePlaneOptions["validateSupersessionSnapshot"];
+  private readonly prepareSupersessionValidation?: MemoryWritePlaneOptions["prepareSupersessionValidation"];
   private readonly resolveSupersessionRef?: MemoryWritePlaneOptions["resolveSupersessionRef"];
   private readonly resolveRecordRef?: MemoryWritePlaneOptions["resolveRecordRef"];
   private readonly faultInjector?: MemoryWritePlaneOptions["faultInjector"];
@@ -817,6 +821,7 @@ export class MemoryWritePlane {
     this.adapter = options.adapter;
     this.supersessionEnabled = options.supersessionEnabled === true;
     this.validateSupersessionSnapshot = options.validateSupersessionSnapshot;
+    this.prepareSupersessionValidation = options.prepareSupersessionValidation;
     this.resolveSupersessionRef = options.resolveSupersessionRef;
     this.resolveRecordRef = options.resolveRecordRef;
     this.faultInjector = options.faultInjector;
@@ -1111,6 +1116,7 @@ export class MemoryWritePlane {
           ...(request.supersessionSnapshot ? {supersessionSnapshot:request.supersessionSnapshot} : {}),
           ...(request.supersessionSnapshot && this.validateSupersessionSnapshot ? {
             supersessionGuard: () => this.validateSupersessionSnapshot!(request.supersedesRef!, request.supersessionSnapshot!) === true,
+            supersessionGuardReady: async () => { await this.prepareSupersessionValidation?.(); },
           } : {}),
         }).catch(async (error: unknown) => {
           if (request.supersedesRef === undefined || !(error instanceof SupersessionConflict)

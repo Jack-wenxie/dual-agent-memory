@@ -1,6 +1,6 @@
 // Synthetic smoke test of the real memory host on an empty store: start the host against a local fake Ollama, save one
-// invented fact through MCP, retry it with the same idempotency key, and check that recall and list stay fail-closed
-// because no projection exists (the projection consumer is not part of this release). Everything lives in a fresh
+// invented fact through MCP, retry it with the same idempotency key, and check that recall and list report retryable reference unavailability
+// while withholding records because no projection exists (the projection consumer is not part of this release). Everything lives in a fresh
 // temporary directory; both servers listen on 127.0.0.1; no real memory, hook, daemon or projection is touched.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -152,11 +152,19 @@ test("synthetic host: save, idempotent retry and fail-closed recall on an empty 
     assert.ok(["stored", "duplicate"].includes(retry.status), `unexpected retry status ${retry.status}`);
     assert.equal(retry.record_ref_status, "pending_projection");
 
+    const table = await (await lancedb.connect(dirs.lancedb)).openTable("memories");
+    assert.equal(await table.countRows(), 1, "the retry must not add a second row");
+    const stored = await table.query().select(["text"]).toArray();
+    assert.deepEqual(stored.map((row) => row.text), [text], "the saved fact is present in the real synthetic primary table");
+    assert.equal(fs.existsSync(path.join(REPO_DIR, "mqe", "data", "projection", "CURRENT.json")), false);
+
     const recall = await call("memory_recall", { query: "demo notebook color" });
-    assert.match(recall, /^No safe matching memories found\./);
+    assert.match(recall, /^Memory references are temporarily unavailable; please retry\. \[mode=/);
+    assert.doesNotMatch(recall, /^No safe matching memories found\./);
     assert.ok(!recall.includes(text) && !/rr1_[0-9a-f]{64}/.test(recall));
     const list = await call("memory_list", {});
-    assert.match(list, /^No safe memories found\./);
+    assert.equal(list, "Memory references are temporarily unavailable; please retry.");
+    assert.doesNotMatch(list, /^No safe memories found\./);
 
     const after = await health(port);
     assert.equal(after.status, "degraded");
@@ -166,8 +174,6 @@ test("synthetic host: save, idempotent retry and fail-closed recall on an empty 
     assert.equal(after.writePlane.consumers.downstream_pending.pending, 0);
     assert.equal(after.writePlane.consumers.downstream_pending["dead-letter"], 0);
 
-    const table = await (await lancedb.connect(dirs.lancedb)).openTable("memories");
-    assert.equal(await table.countRows(), 1, "the retry must not add a second row");
     assert.equal(filesIn(path.join(dirs.data, "write-plane", "consumers", "projection-invalidation", "pending")).length, 1);
 
     const seen = new Set(ollama.calls.map((item) => `${item.method} ${item.url}`));

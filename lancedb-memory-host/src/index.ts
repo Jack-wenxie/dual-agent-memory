@@ -39,7 +39,7 @@ import { SafeSummaryRejectedError } from "./companion-safe-summary.js";
 import { SupersessionConflict } from "./supersession-contract.js";
 import { createBm25DiagnosticWindow, formatBm25DiagnosticLine } from "./bm25-public-diagnostic.js";
 import { projectionConsumerHealthFromValue, type ProjectionConsumerHealthSummary } from "./projection-consumer-health.js";
-import { ProjectionRefResolver } from "./projection-ref-resolver.js";
+import { loadProjectionInWorker, ProjectionRefResolver } from "./projection-ref-resolver.js";
 import { preparePublicRecallResults, SAFE_SUMMARY_BUDGET_MS, SAFE_SUMMARY_MAX_READS } from "./safe-summary-recall.js";
 import { selectRecallLifecycle } from "./recall-lifecycle.js";
 import { createWeakSingleLaneObserver } from "./weak-single-lane-observer.mjs";
@@ -80,7 +80,16 @@ const SECRET_FILE = process.env.SECRET_FILE || path.join(MEMORY_DATA, ".lancedb-
 const MEMORY_WAL_KEY_FILE = process.env.MEMORY_WAL_KEY_FILE || path.join(MEMORY_DATA, "write-plane", ".wal-key");
 const HOST_SOURCE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const MQE_ROOT = path.resolve(HOST_SOURCE_DIR, "../../mqe");
-const projectionRefResolver = new ProjectionRefResolver(MQE_ROOT);
+// Projection loads (checksum, integrity_check) run in a worker, never on a request path: a cheap
+// CURRENT watch starts one as soon as a generation is published, and ref lookups first await a
+// bounded ensureCurrent().
+const PROJECTION_REF_WAIT_MS = 5_000;
+const projectionRefResolver = new ProjectionRefResolver(MQE_ROOT, { backgroundLoadProjection: loadProjectionInWorker });
+projectionRefResolver.startPrefetch(750);
+// Candidates whose refs cannot be minted because the current projection is not loaded are not
+// "no match": recall and list say so, and the caller retries.
+const PROJECTION_REFS_UNAVAILABLE_TEXT = "Memory references are temporarily unavailable; please retry.";
+
 // Opt-in by the host operator only; ordinary tool input cannot enable summaries.
 const SAFE_SUMMARY_ENABLED = process.env.MEMORY_SAFE_SUMMARY_ENABLED === "1";
 const SUPERSESSION_ENABLED = process.env.MEMORY_SUPERSESSION_ENABLED === "1";
@@ -379,10 +388,16 @@ async function initializeProStore(): Promise<void> {
       rootDir: WRITE_PLANE_ROOT,
       encryptionSecret: WRITE_PLANE_ENCRYPTION_SECRET,
       adapter: createWritePlaneAdapter(candidateStore, candidateCoordinator),
-      resolveRecordRef: (recordRef) => projectionRefResolver.recordIdForRef(recordRef),
+      // Only the loaded current projection may answer "absent"; an unloaded one fails retryably.
+      resolveRecordRef: (recordRef) => projectionRefResolver.recordIdForMutationRef(recordRef, PROJECTION_REF_WAIT_MS),
       supersessionEnabled: SUPERSESSION_ENABLED,
-      resolveSupersessionRef: (recordRef) => projectionRefResolver.captureSupersessionProjection(recordRef),
+      resolveSupersessionRef: async (recordRef) => {
+        await projectionRefResolver.ensureCurrent(PROJECTION_REF_WAIT_MS);
+        return projectionRefResolver.captureSupersessionProjection(recordRef);
+      },
       validateSupersessionSnapshot: (recordRef, snapshot) => projectionRefResolver.supersessionSnapshotIsCurrent(recordRef, snapshot),
+      // The synchronous veto never loads, so the projection it reads is first loaded off-thread.
+      prepareSupersessionValidation: () => projectionRefResolver.ensureCurrent(PROJECTION_REF_WAIT_MS),
       producerAdmission: (operation, capability) => {
         if (!c08MaintenanceBarrier.blocksProducers) return;
         if (operation === "recovery"
@@ -669,10 +684,16 @@ function createServer(sessionLeaseOwner: ExclusiveEvaluationOwner | null) {
           ...retrievalFailureAudit(semanticError),
         });
       }
+      // Bounded wait for the off-thread projection load, so the ref lookups below hit the cache.
+      const projectionRefsReady = outcome.results.length === 0
+        || await projectionRefResolver.ensureCurrent(PROJECTION_REF_WAIT_MS);
       // The current projection lifecycle applies after the cache and before the final limit.
       const lifecycle = selectRecallLifecycle(outcome.results, query, projectionRefResolver);
-      // Observation is private and never changes outcome, lifecycle or returned results.
-      if (sessionLeaseOwner === null && o001WeakObserver && o001Counts?.active) {
+      const projectionRefsUnavailable = outcome.results.length > 0
+        && (!projectionRefsReady || !projectionRefResolver.hasCurrentProjection());
+      // Observation is private and never changes outcome, lifecycle or returned results. A call
+      // whose refs were unavailable selected nothing and is not observed.
+      if (!projectionRefsUnavailable && sessionLeaseOwner === null && o001WeakObserver && o001Counts?.active) {
         try {
           o001Counts.noteCall();
           const observedAt = performance.now();
@@ -694,11 +715,12 @@ function createServer(sessionLeaseOwner: ExclusiveEvaluationOwner | null) {
           .filter((result): result is NonNullable<ReturnType<typeof publicMemoryResult>> => result !== null)
           .slice(0, safeLimit);
       const lifecycleChanged = !lifecycle.isCurrent();
-      const publicResults = lifecycleChanged ? [] : lifecycle.label(unlabeledResults);
-      audit("memory_recall", "memory_query", "success", {
+      const publicResults = lifecycleChanged || projectionRefsUnavailable ? [] : lifecycle.label(unlabeledResults);
+      audit("memory_recall", "memory_query", projectionRefsUnavailable ? "degraded" : "success", {
         found: publicResults.length,
         mode: outcome.mode,
         cacheStatus: outcome.cacheStatus,
+        ...(projectionRefsUnavailable ? { projectionRefs: "unavailable" } : {}),
         ...(outcome.mode === MEMORY_LOCAL_LEXICAL_MODE ? {} : {
           vectorStatus: outcome.branches.vector,
           bm25Status: outcome.branches.bm25,
@@ -720,9 +742,10 @@ function createServer(sessionLeaseOwner: ExclusiveEvaluationOwner | null) {
         : "";
       const diagnosticSuffix = bm25DiagnosticLine ? "\n" + bm25DiagnosticLine : "";
       if (!publicResults.length) {
-        const emptyText = preparedPublicResults?.invalidated === true || lifecycleChanged
-          ? "Memory changed during recall; please retry."
-          : "No safe matching memories found.";
+        const emptyText = projectionRefsUnavailable ? PROJECTION_REFS_UNAVAILABLE_TEXT
+          : preparedPublicResults?.invalidated === true || lifecycleChanged
+            ? "Memory changed during recall; please retry."
+            : "No safe matching memories found.";
         return {
           content: [{ type: "text" as const, text: `${emptyText} ${retrievalMeta}${diagnosticSuffix}` }],
           ...recallDiagnostics,
@@ -775,6 +798,8 @@ function createServer(sessionLeaseOwner: ExclusiveEvaluationOwner | null) {
         delivery: outcome.delivery,
         companionRequired: companion_required === true,
       });
+      // A freshly stored id is in no published generation yet; only a duplicate's ref can be ready.
+      if (outcome.status === "duplicate" && outcome.memory_id) await projectionRefResolver.ensureCurrent(PROJECTION_REF_WAIT_MS);
       const recordRef = outcome.memory_id
         ? projectionRefResolver.recordRefForId(outcome.memory_id)
         : null;
@@ -818,6 +843,8 @@ function createServer(sessionLeaseOwner: ExclusiveEvaluationOwner | null) {
         idempotencyKey: legacyIdempotencyKey(normalized),
       });
       audit("memory_store", "memory_payload", "success", { stored: true, writePlane: true });
+      // A freshly stored id is in no published generation yet; only a duplicate's ref can be ready.
+      if (outcome.status === "duplicate" && outcome.memory_id) await projectionRefResolver.ensureCurrent(PROJECTION_REF_WAIT_MS);
       const recordRef = outcome.memory_id
         ? projectionRefResolver.recordRefForId(outcome.memory_id)
         : null;
@@ -937,6 +964,8 @@ function createServer(sessionLeaseOwner: ExclusiveEvaluationOwner | null) {
     try {
       const safeLimit = Math.min(Math.max(1, Math.floor(limit || 20)), 50);
       const candidates = await proStore.list(undefined, category, Math.min(50, safeLimit * 4), 0);
+      const projectionRefsReady = candidates.length === 0
+        || await projectionRefResolver.ensureCurrent(PROJECTION_REF_WAIT_MS);
       const results = candidates
         .map((entry) => publicMemoryResult(
           { entry, sources: [] },
@@ -944,6 +973,10 @@ function createServer(sessionLeaseOwner: ExclusiveEvaluationOwner | null) {
         ))
         .filter((result): result is NonNullable<ReturnType<typeof publicMemoryResult>> => result !== null)
         .slice(0, safeLimit);
+      if (candidates.length > 0 && (!projectionRefsReady || !projectionRefResolver.hasCurrentProjection())) {
+        audit("memory_list", "memory_list", "degraded", { found: 0, projectionRefs: "unavailable" });
+        return { content: [{ type: "text" as const, text: PROJECTION_REFS_UNAVAILABLE_TEXT }] };
+      }
       audit("memory_list", "memory_list", "success", { found: results.length });
       if (!results.length) return { content: [{ type: "text" as const, text: "No safe memories found." }] };
       return { content: [{ type: "text" as const, text: formatPublicMemories(results) }] };

@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { performance as nodePerformance } from "node:perf_hooks";
 import { parseEmbeddedWritePlane } from "./mutation-write-plane.js";
 import { SupersessionConflict, parseProjectionTarget, primarySnapshot, sameSnapshot, hasCommittedSuccessor, committedSupersessionLineage, type SupersessionSnapshot, type SupersessionProjectionTarget } from "./supersession-contract.js";
 import {unknownBranch,finitePrivateNumber,freezePrivateCopy,type BranchScoreEvidence,type PrivateScoreEvidence} from "../memory-lancedb-pro/src/private-score-provenance.js";
@@ -68,7 +69,13 @@ export interface RetrievalBranchTelemetry {
   active_timeouts: number;
   native_attempts: number;
   final_branch: RetrievalBranchStatus;
+  // Present only when a host stall was measured in one of this branch's deadline
+  // windows: the longest one, a lower bound of how long the host held its loop.
+  host_stall_ms?: number;
 }
+
+// Timeouts classified as host stalls; present only once nonzero.
+type HostStallCount = { hostStallTimeouts?: number };
 
 export interface MemoryCoordinatorDiagnostics {
   mode: MemorySearchMode;
@@ -80,13 +87,13 @@ export interface MemoryCoordinatorDiagnostics {
     generation: number;
   };
   circuits: {
-    vector: { state: CircuitState; consecutiveFailures: number; timedOutInFlight: number };
-    bm25: { state: CircuitState; consecutiveFailures: number; timedOutInFlight: number };
+    vector: { state: CircuitState; consecutiveFailures: number; timedOutInFlight: number } & HostStallCount;
+    bm25: { state: CircuitState; consecutiveFailures: number; timedOutInFlight: number } & HostStallCount;
   };
   primaryRead: {
     state: CircuitState; consecutiveFailures: number; timedOutInFlight: number;
     timing: RetrievalBranchTelemetry | null; activeMutations: number;
-  };
+  } & HostStallCount;
   nativeRetrievalGate: { locked: boolean; pending: number };
   retrievalTiming: {
     vector: RetrievalBranchTelemetry | null;
@@ -471,6 +478,7 @@ class BranchCircuitBreaker {
   private failures = 0;
   private retryAt = 0;
   private probeInFlight = false;
+  private inconclusiveRun = 0;
 
   constructor(
     private readonly failureThreshold: number,
@@ -492,16 +500,32 @@ class BranchCircuitBreaker {
     this.failures = 0;
     this.retryAt = 0;
     this.probeInFlight = false;
+    this.inconclusiveRun = 0;
   }
 
   failure(now: number): void {
     const halfOpenFailure = this.stateValue === "half_open";
     this.probeInFlight = false;
+    this.inconclusiveRun = 0;
     this.failures += 1;
     if (halfOpenFailure || this.failures >= this.failureThreshold) {
       this.stateValue = "open";
       this.retryAt = now + this.cooldownMs;
     }
+  }
+
+  // Neither success nor failure: a half-open probe returns its slot at once. Every
+  // second one in a row still counts, so repeated host stalls can neither keep a
+  // hung backend probed on every call nor keep its circuit closed for good.
+  inconclusive(now: number): void {
+    this.inconclusiveRun += 1;
+    if (this.inconclusiveRun >= 2) {
+      this.failure(now);
+      return;
+    }
+    if (this.stateValue !== "half_open") return;
+    this.stateValue = "open";
+    this.probeInFlight = false;
   }
 
   snapshot(): { state: CircuitState; consecutiveFailures: number } {
@@ -522,10 +546,64 @@ class BranchTimeoutError extends Error {
   }
 }
 
+// A deadline window in which the host's own event loop was held up (sync work, GC,
+// paging) says nothing about the backend: its timer ran this late, or the main
+// thread was busy this long inside it, and for at least this share of it.
+const HOST_STALL_MS = 100;
+const HOST_STALL_SHARE = 0.2;
+
+type StallAwareDeadline = { cancel(): void };
+
+// After a stall in an I/O or check callback, libuv runs an overdue timer before it
+// polls I/O that completed meanwhile, so a stalled deadline yields one poll turn
+// (setImmediate) for that work to settle first.
+function startStallAwareDeadline(
+  delayMs: number,
+  onDeadline: () => void,
+  onHostStall: (stallMs: number) => void,
+): StallAwareDeadline {
+  const armedAt = performance.now();
+  const armedIdleMs = nodePerformance.eventLoopUtilization().idle;
+  let stalled = false;
+  let fired = false;
+  let cancelled = false;
+  let deferred: NodeJS.Immediate | undefined;
+  const noteIfStalled = (): boolean => {
+    const windowMs = performance.now() - armedAt;
+    const lateMs = windowMs - delayMs;
+    // Busy is all time not spent waiting in the event provider; a window armed
+    // before the loop started has no idle time yet, so it is counted right too.
+    const busyMs = windowMs - (nodePerformance.eventLoopUtilization().idle - armedIdleMs);
+    if (!stalled && (lateMs > HOST_STALL_MS
+      || busyMs > Math.max(HOST_STALL_MS, windowMs * HOST_STALL_SHARE))) {
+      stalled = true;
+      onHostStall(Math.max(lateMs, busyMs));
+    }
+    return stalled;
+  };
+  const timer = setTimeout(() => {
+    // Decided when the deadline runs: a stall right after it cannot excuse it.
+    fired = true;
+    if (noteIfStalled()) deferred = setImmediate(onDeadline);
+    else onDeadline();
+  }, delayMs);
+  return {
+    // Also notes a stall when the work settled first, inside a stalled window.
+    cancel: () => {
+      if (cancelled) return;
+      cancelled = true;
+      clearTimeout(timer);
+      if (deferred) clearImmediate(deferred);
+      if (!fired) noteIfStalled();
+    },
+  };
+}
+
 class BranchBudgetClock {
   private activeAccumulatedMs = 0;
   private activeStartedAt: number | null = performance.now();
   private admissionAccumulatedMs = 0;
+  private stallForgivenMs = 0;
 
   constructor(
     private readonly activeBudgetMs: number,
@@ -552,11 +630,16 @@ class BranchBudgetClock {
   }
 
   remainingActiveMs(): number {
-    return Math.max(0, this.activeBudgetMs - this.activeMs());
+    return Math.max(0, this.activeBudgetMs + this.stallForgivenMs - this.activeMs());
   }
 
   remainingAdmissionMs(): number {
     return Math.max(0, this.admissionBudgetMs - this.admissionAccumulatedMs);
+  }
+
+  // Active time that a host stall made unattributable is not charged to the backend.
+  forgiveStall(ms: number): void {
+    this.stallForgivenMs += Math.max(0, ms);
   }
 
   finish(): void {
@@ -688,6 +771,11 @@ export class MemoryCoordinator {
     bm25: 0,
     primary: 0,
   };
+  private readonly hostStallTimeouts: Record<"vector" | "bm25" | "primary", number> = {
+    vector: 0,
+    bm25: 0,
+    primary: 0,
+  };
   private currentSearchMode: MemorySearchMode = MEMORY_SEARCH_MODE;
   private cacheGeneration = 0;
   private primaryMutationGeneration = 0;
@@ -757,6 +845,7 @@ export class MemoryCoordinator {
       primaryRead: {
         ...this.circuits.primary.snapshot(),
         timedOutInFlight: this.timedOutInFlight.primary,
+        ...this.hostStallCount("primary"),
         timing: this.lastRetrievalTiming.primary ? { ...this.lastRetrievalTiming.primary } : null,
         activeMutations: this.primaryMutationsActive,
       },
@@ -776,13 +865,20 @@ export class MemoryCoordinator {
         vector: {
           ...this.circuits.vector.snapshot(),
           timedOutInFlight: this.timedOutInFlight.vector,
+          ...this.hostStallCount("vector"),
         },
         bm25: {
           ...this.circuits.bm25.snapshot(),
           timedOutInFlight: this.timedOutInFlight.bm25,
+          ...this.hostStallCount("bm25"),
         },
       },
     };
+  }
+
+  // Optional, so stall-free diagnostics keep their exact shape.
+  private hostStallCount(branch: "vector" | "bm25" | "primary"): HostStallCount {
+    return this.hostStallTimeouts[branch] > 0 ? { hostStallTimeouts: this.hostStallTimeouts[branch] } : {};
   }
   clearRecallCache(): void {
     this.cacheGeneration += 1;
@@ -969,6 +1065,27 @@ export class MemoryCoordinator {
     };
     let branchFinalized = false;
     let lateNativeSucceeded = false;
+    // Longest host stall measured in this branch's deadline windows; 0 when none.
+    let hostStallMs = 0;
+    // A timeout is the host's fault when the window of the deadline that ended it stalled.
+    let lastDeadlineStalled = false;
+    let stallForgiven = false;
+    const armDeadline = (
+      delayMs: number,
+      onDeadline: () => void,
+      stepStartedActiveMs: number | null,
+    ): StallAwareDeadline => {
+      lastDeadlineStalled = false;
+      return startStallAwareDeadline(delayMs, onDeadline, (stallMs) => {
+        lastDeadlineStalled = true;
+        hostStallMs = Math.max(hostStallMs, stallMs);
+        // Give the first stalled active step its stalled time back, so work it
+        // completed can still finish the branch; later stalls only classify it.
+        if (stepStartedActiveMs === null || stallForgiven) return;
+        stallForgiven = true;
+        clock.forgiveStall(Math.min(stallMs, clock.activeMs() - stepStartedActiveMs));
+      });
+    };
 
     const finish = (status: RetrievalBranchStatus): RetrievalBranchTelemetry => {
       clock.finish();
@@ -982,6 +1099,7 @@ export class MemoryCoordinator {
         active_timeouts: counters.activeTimeouts,
         native_attempts: counters.nativeAttempts,
         final_branch: status,
+        ...(hostStallMs > 0 ? { host_stall_ms: round(hostStallMs) } : {}),
       };
       this.lastRetrievalTiming[branch] = telemetry;
       return telemetry;
@@ -997,7 +1115,8 @@ export class MemoryCoordinator {
           counters.activeTimeouts += 1;
           throw new BranchTimeoutError("active");
         }
-        let timer: NodeJS.Timeout | undefined;
+        const stepStartedActiveMs = clock.activeMs();
+        let timer: StallAwareDeadline | undefined;
         const operation = Promise.resolve()
           .then(() => activeWork(controller.signal))
           .then(
@@ -1005,13 +1124,13 @@ export class MemoryCoordinator {
             (error) => ({ kind: "error" as const, error }),
           );
         const timeout = new Promise<{ kind: "timeout" }>((resolve) => {
-          timer = setTimeout(() => {
+          timer = armDeadline(remaining, () => {
             resolve({ kind: "timeout" });
             controller.abort();
-          }, remaining);
+          }, stepStartedActiveMs);
         });
         const settled = await Promise.race([operation, timeout]);
-        if (timer) clearTimeout(timer);
+        timer?.cancel();
         if (settled.kind === "timeout") {
           counters.activeTimeouts += 1;
           throw new BranchTimeoutError("active");
@@ -1034,20 +1153,20 @@ export class MemoryCoordinator {
           throw new BranchTimeoutError("admission");
         }
 
+        const stepStartedActiveMs = clock.activeMs();
         clock.pauseForAdmission();
         const waitStartedAt = performance.now();
         const admissionController = new AbortController();
         let admissionTimedOut = false;
         let admissionBudgetExceeded = false;
         let admissionRecorded = false;
-        let admissionTimer: NodeJS.Timeout | undefined;
         const relayAbort = () => admissionController.abort();
         if (controller.signal.aborted) relayAbort();
         else controller.signal.addEventListener("abort", relayAbort, { once: true });
-        admissionTimer = setTimeout(() => {
+        const admissionTimer = armDeadline(Math.max(1, admissionRemaining), () => {
           admissionTimedOut = true;
           admissionController.abort();
-        }, Math.max(1, admissionRemaining));
+        }, null);
 
         let release: (() => void) | undefined;
         try {
@@ -1083,9 +1202,11 @@ export class MemoryCoordinator {
           }
           throw error;
         } finally {
-          if (admissionTimer) clearTimeout(admissionTimer);
+          admissionTimer.cancel();
           controller.signal.removeEventListener("abort", relayAbort);
         }
+        // Admitted: a stall in a wait that no active budget paid for classifies no later timeout.
+        lastDeadlineStalled = false;
 
         if (!release) throw new Error("Native retrieval admission lost its release lease");
         const watchdogGraceMs = Math.min(5, Math.max(1, Math.floor(deadlineMs * 0.02)));
@@ -1131,14 +1252,14 @@ export class MemoryCoordinator {
               return { kind: "error" as const, error };
             },
           );
-        let watchdogTimer: NodeJS.Timeout | undefined;
+        let watchdogTimer: StallAwareDeadline | undefined;
         const watchdog = new Promise<{ kind: "watchdog" }>((resolve) => {
-          watchdogTimer = setTimeout(() => {
+          watchdogTimer = armDeadline(Math.max(1, watchdogMs), () => {
             resolve({ kind: "watchdog" });
-          }, Math.max(1, watchdogMs));
+          }, stepStartedActiveMs);
         });
         const nativeSettled = await Promise.race([operation, watchdog]);
-        if (watchdogTimer) clearTimeout(watchdogTimer);
+        watchdogTimer?.cancel();
         if (nativeSettled.kind === "watchdog") {
           if (!settled) {
             lateTracked = true;
@@ -1178,7 +1299,14 @@ export class MemoryCoordinator {
         if (error.kind === "native" && counters.nativeTimeouts === 0) counters.nativeTimeouts += 1;
         if (error.kind === "active" && counters.activeTimeouts === 0) counters.activeTimeouts += 1;
       }
-      circuit.failure(this.options.now());
+      // A timeout the host caused says little about the backend: this call still
+      // degrades, but the circuit takes it as inconclusive, not as a failure.
+      if (status === "timeout" && lastDeadlineStalled) {
+        circuit.inconclusive(this.options.now());
+        this.hostStallTimeouts[branch] += 1;
+      } else {
+        circuit.failure(this.options.now());
+      }
       branchFinalized = true;
       if (lateNativeSucceeded) circuit.success();
       const telemetry = finish(status);
@@ -1631,6 +1759,7 @@ export class MemoryCoordinator {
     metadata?: string;
     supersessionSnapshot?: SupersessionSnapshot;
     supersessionGuard?: () => boolean;
+    supersessionGuardReady?: () => Promise<unknown>;
   }): Promise<StoreOutcome> {
     const durableDuplicate = await this.mutex.runExclusive(async () => this.index.duplicate(input.text));
     if (durableDuplicate && !input.supersessionSnapshot) return { status: "duplicate", entry: durableDuplicate };
@@ -1640,6 +1769,8 @@ export class MemoryCoordinator {
         const lineage = committedSupersessionLineage({ id:input.id ?? "", text:input.text, scope:input.scope ?? "global", category:input.category, metadata:input.metadata }, parseEmbeddedWritePlane);
         if (!lineage || !sameSnapshot(lineage.predecessor, input.supersessionSnapshot)) throw new SupersessionConflict("lineage_invalid");
         await this.assertSupersessionTarget(input.supersessionSnapshot);
+        // Last await before the synchronous veto: what the veto reads must be ready by now.
+        if (input.supersessionGuardReady) await input.supersessionGuardReady();
       }
       const duplicate = this.index.duplicate(input.text);
       if (duplicate && input.supersessionSnapshot) throw new SupersessionConflict("duplicate_text");
